@@ -1,0 +1,103 @@
+# FILE: .\configs\solver_settings_1.yaml
+# ==============================================================================
+# PART 2: SOLVER SETTINGS
+# ==============================================================================
+gpu_profile: "RTX" 
+
+restart_configuration:
+  enable_restart: false
+  file_path: ""
+
+mesh_settings:
+  initial_ground_mesh_size: 1_000_000
+  final_target_of_active_elements: 1_000_000
+  max_growth_rate: 1.1
+  nominal_refinement_threshold: 0.9
+  exponent_for_refinement_schedule: 1.0 
+  max_background_elements: 1_000_000
+  gpu_solver_safety_factor: 0.95
+
+# ------------------------------------------------------------------------------
+# OPTIMIZATION LOOP
+# ------------------------------------------------------------------------------
+number_of_iterations: 100
+hard_stop_after_iteration: 120
+
+optimization_parameters:
+  # --- TARGET PARAMETERS ---
+  # Force solver to reach this stress.
+  target_l1_stress: 1.5
+  target_volume_fraction: -1.0 # Disabled
+
+  # --- CULLING PARAMETERS ---
+  # Max removal per iteration (Set to 0.0 when overstressed)
+  max_culling_ratio: 0.05
+  # Static Physics threshold (Legacy/Base)
+  culling_threshold: 0.1     
+  culling_target_at_end: 0.9
+  
+  density_update_method: "hard"
+  min_density: 0.0001
+  density_clamp_max: 1
+
+  # --- ADAPTIVE CONTROL SETTINGS (NEW) ---
+  # 1. Convergence Criteria
+  convergence_stability_tolerance: 0.02      # < 2% of elements changing state
+  convergence_stress_error_tolerance: 0.01   # < 1% deviation from target stress
+  convergence_required_streak: 5             # Must be stable for 5 iters to stop
+
+  # 2. Controller Gains (Reaction to Stress Error)
+  # Decrease allowable stress (add mass) when Overstressed
+  control_gain_drop_base: 0.02
+  control_gain_drop_proportional: 0.15
+  # Increase allowable stress (remove mass) when Understressed
+  control_gain_raise_base: 0.01
+  control_gain_raise_proportional: 0.05
+
+  # 3. Dynamic Culling Cutoff Control
+  initial_culling_cutoff: 0.05
+  control_cutoff_decrement_step: 0.01        # How fast to lower cutoff in danger
+  control_cutoff_increment_step: 0.005       # How fast to raise cutoff in safety
+  control_cutoff_max_limit: 0.4              # Don't delete elements stiffer than this
+
+  # 4. Update Damping
+  # Exponent for multiplicative update (0.5 = Sqrt damping)
+  update_damping_exponent: 0.5
+
+  # 5. Radius Decay Rates
+  radius_decay_nominal: 0.99
+  radius_decay_aggressive: 0.95              # Used when stability is poor
+
+  # --- FILTER RADIUS SETTINGS ---
+  minimum_feature_size_physical: 0.6
+  minimum_feature_size_elements: 1.5 
+  radius_max_multiplier: 4.0
+  radius_min_multiplier: 1.0
+  radius_decay_exponent: 1.5
+  constraint_constant: 0.25
+
+solver_parameters:
+  solver_type: gpu               
+  preconditioner: "multigrid"
+  tolerance: 1.e-6 
+  max_iterations: 30000 
+  diagonal_shift_factor: 1.e-7 
+  stagnation_tolerance: 1.0e-3
+  max_shift_attempts: 7
+  shift_multiplier: 10.0
+  gpu_method: krylov        
+  krylov_solver: cg               
+
+output_settings:
+  export_frequency: 1       
+  save_bin_frequency: 1
+  save_STL_frequency: 20    
+  save_VTK_frequency: 1     
+  save_principal_stress_vectors: no
+  log_filename: simulation_log.txt
+  iso_surface_threshold: 0.01
+  stl_subdivision_level: 1       
+  stl_smoothing_passes: 1        
+  stl_mesh_smoothing_iters: 3    
+  maximum_cells_in_binary_output: 25_000_000
+  stl_target_triangle_count: 500000

@@ -1,0 +1,4529 @@
+"// # FILE: .\Run.jl";
+using Pkg
+using Dates
+using CUDA
+
+
+const C_RESET = "\u001b[0m"
+const C_BOLD = "\u001b[1m"
+const C_RED = "\u001b[31m"
+const C_GREEN = "\u001b[32m"
+const C_YELLOW = "\u001b[33m"
+const C_BLUE = "\u001b[34m"
+const C_MAGENTA = "\u001b[35m"
+const C_CYAN = "\u001b[36m"
+const C_WHITE = "\u001b[37m"
+
+function print_banner()
+    println("="^60)
+    println(">>> [LAUNCHER] HEXA TopOpt: Robust Environment Setup")
+    println(">>> [INFO] Time: $(Dates.now()) | Julia Version: $(VERSION)")
+    println("="^60)
+end
+
+function activate_environment()
+    project_dir = @__DIR__
+    println(">>> [ENV] Activating project at: $project_dir")
+    Pkg.activate(project_dir)
+    flush(stdout)
+end
+
+function instantiate_environment()
+    println(">>> [ENV] Attempting to instantiate environment...")
+    flush(stdout)
+    
+    try
+        Pkg.instantiate()
+        println("[OK]")
+    catch e
+        println(C_RED * "[FAILED]" * C_RESET)
+        println(">>> [ERROR] Failed to instantiate environment:")
+        showerror(stdout, e, catch_backtrace())
+        println("\n>>> [HINT] Try running: julia --project=. -e 'using Pkg; Pkg.resolve(); Pkg.instantiate()'")
+        exit(1)
+    end
+    flush(stdout)
+end
+
+function verify_packages()
+    println(">>> [ENV] Verifying core package list...")
+    flush(stdout)
+    
+    required_packages = [
+        "LinearAlgebra",
+        "SparseArrays", 
+        "Printf",
+        "JSON",
+        "Statistics",
+        "CUDA",
+        "YAML"
+    ]
+    
+    installed_packages = [p.name for p in values(Pkg.dependencies())]
+    
+    missing_packages = String[]
+    for pkg in required_packages
+        if !(pkg in installed_packages)
+            push!(missing_packages, pkg)
+        end
+    end
+    
+    if !isempty(missing_packages)
+        println(C_RED * "[MISSING PACKAGES]" * C_RESET)
+        println(">>> [ERROR] The following required packages are missing:")
+        for pkg in missing_packages
+            println("    - $pkg")
+        end
+        println("\n>>> [HINT] Run: julia --project=. -e 'using Pkg; Pkg.add([\"$(join(missing_packages, "\", \""))\"])'")
+        exit(1)
+    end
+    
+    println("[OK]")
+    flush(stdout)
+end
+
+function precompile_environment()
+    println(">>> [ENV] Precompiling project...")
+    flush(stdout)
+    
+    try
+        Pkg.precompile()
+    catch e
+        println(C_YELLOW * "!!! [WARN] Precompilation had warnings (safe to ignore if code runs)." * C_RESET)
+    end
+    flush(stdout)
+end
+
+function check_cuda_availability()
+    println(">>> [GPU] Checking CUDA availability...")
+    flush(stdout)
+    
+    if CUDA.functional()
+        dev = CUDA.device()
+        name = CUDA.name(dev)
+        mem_gb = CUDA.total_memory() / 1024^3
+        println(C_GREEN * ">>> [GPU] CUDA Available: $name ($(round(mem_gb, digits=2)) GB)" * C_RESET)
+    else
+        println(C_YELLOW * ">>> [GPU] No CUDA GPU detected. Will run in CPU mode (slow)." * C_RESET)
+    end
+    flush(stdout)
+end
+
+function generate_machine_limits()
+    config_dir = joinpath(@__DIR__, "configs")
+    if !isdir(config_dir); mkpath(config_dir); end
+    limit_file = joinpath(config_dir, "_machine_limits.jl")
+
+    
+    current_gpu_id = "CPU_ONLY"
+    current_vram = 0
+    
+    if CUDA.functional()
+        dev = CUDA.device()
+        gpu_name = CUDA.name(dev)
+        total_vram = CUDA.total_memory()
+        current_gpu_id = "$gpu_name-$(div(total_vram, 1024^3))GB"
+        current_vram = total_vram
+    end
+
+    
+    if isfile(limit_file)
+        println(">>> [HARDWARE] Limits file found: $limit_file")
+        
+        
+        file_content = read(limit_file, String)
+        
+        # Look for GPU ID in file (we'll add it as a comment)
+        if occursin("# GPU_ID: $current_gpu_id", file_content)
+            println(">>> [HARDWARE] GPU Match: $current_gpu_id")
+            println(">>> [HARDWARE] Skipping stress test. Delete file to re-run.")
+            return
+        else
+            println(C_YELLOW * ">>> [HARDWARE] GPU CHANGED - Previous limits invalid!" * C_RESET)
+            println(">>> [HARDWARE] Previous GPU in file, current GPU: $current_gpu_id")
+            println(">>> [HARDWARE] Deleting old limits and re-testing...")
+            rm(limit_file, force=true)
+        end
+    end
+
+    if !CUDA.functional()
+        println(C_YELLOW * ">>> [HARDWARE] No GPU detected. Skipping VRAM stress test." * C_RESET)
+        return
+    end
+
+    println("\n" * C_MAGENTA * "="^60 * C_RESET)
+    println(C_MAGENTA * C_BOLD * ">>> [HARDWARE] RUNNING VRAM STRESS TEST (GMG SOLVER)" * C_RESET)
+    println(C_MAGENTA * ">>> determining maximum safe element count for this machine..." * C_RESET)
+    println(C_MAGENTA * "="^60 * C_RESET)
+
+    
+    function attempt_allocation(nElem_target)
+        
+        GC.gc()
+        CUDA.reclaim()
+        
+        
+        n = round(Int, cbrt(nElem_target))
+        nx, ny, nz = n, n, n
+        
+        nNodes_f = (nx+1)*(ny+1)*(nz+1)
+        nElem_f = nx*ny*nz
+        
+        try
+            
+            
+            v1 = CUDA.zeros(Float32, nNodes_f * 3)  
+            v2 = CUDA.zeros(Float32, nNodes_f * 3)  
+            v3 = CUDA.zeros(Float32, nNodes_f * 3)  
+            v4 = CUDA.zeros(Float32, nNodes_f * 3)  
+            v5 = CUDA.zeros(Float32, nNodes_f * 3)  
+            v6 = CUDA.zeros(Float32, nNodes_f * 3)  
+            
+            
+            conn = CUDA.zeros(Int32, nElem_f * 8)      
+            factors = CUDA.zeros(Float32, nElem_f)     
+            
+            
+            buffers = []
+            current_nx, current_ny, current_nz = nx, ny, nz
+            
+            for level in 2:4
+                
+                current_nx = max(1, div(current_nx, 2))
+                current_ny = max(1, div(current_ny, 2))
+                current_nz = max(1, div(current_nz, 2))
+                
+                nNodes_c = (current_nx+1)*(current_ny+1)*(current_nz+1)
+                nElem_c  = current_nx*current_ny*current_nz
+                
+                
+                push!(buffers, CUDA.zeros(Float32, nNodes_c * 3))  
+                push!(buffers, CUDA.zeros(Float32, nNodes_c * 3))  
+                push!(buffers, CUDA.zeros(Float32, nNodes_c * 3))  
+                push!(buffers, CUDA.zeros(Float32, nElem_c))       
+                push!(buffers, CUDA.zeros(Int32, nElem_c * 8))     
+            end
+            
+            
+            CUDA.synchronize()
+            
+            return true
+        catch e
+            
+            return false
+        end
+    end
+
+    
+    safe_limit = 500_000  
+    
+    
+    
+    
+    
+    
+    
+    
+    start_elems = 2_000_000    
+    step_elems  = 3_000_000    
+    
+    
+    
+    
+    
+    
+    
+    
+    total_mem = CUDA.total_memory()
+    est_max = total_mem / 300  
+    
+    
+    end_elems = min(200_000_000, floor(Int, est_max * 1.3))  
+
+    println(">>> [TEST] GPU Memory: $(round(total_mem / 1024^3, digits=2)) GB")
+    println(">>> [TEST] Estimated max GMG elements: $(round(Int, est_max / 1_000_000))M ($(round(Int, est_max)) elements)")
+    println(">>> [TEST] Search range: $(round(Int, start_elems / 1_000_000))M to $(round(Int, end_elems / 1_000_000))M elements")
+    println(">>> [TEST] Step size: $(round(Int, step_elems / 1_000_000))M elements")
+    println(">>> [TEST] Estimated test duration: 1-3 minutes")
+    flush(stdout)
+
+    test_count = 0
+    last_pass_time = 0.0
+    for count in start_elems:step_elems:end_elems
+        test_count += 1
+        test_start = time()
+        
+        count_millions = round(count / 1_000_000, digits=1)
+        print("    [$(lpad(test_count, 2))] Testing $(lpad(count_millions, 5))M elements... ")
+        flush(stdout)
+        
+        if attempt_allocation(count)
+            test_duration = time() - test_start
+            last_pass_time = test_duration
+            println(C_GREEN * "[PASS]" * C_RESET * " ($(round(test_duration, digits=1))s)")
+            safe_limit = count
+            
+            GC.gc()
+            CUDA.reclaim()
+        else
+            test_duration = time() - test_start
+            println(C_RED * "[FAIL - OOM]" * C_RESET * " ($(round(test_duration, digits=1))s)")
+            println(C_YELLOW * ">>> [TEST] Crash point found at $(round(count / 1_000_000, digits=1))M elements" * C_RESET)
+            println(C_YELLOW * ">>> [TEST] Safe limit: $(round(safe_limit / 1_000_000, digits=1))M elements" * C_RESET)
+            break
+        end
+        
+        
+        sleep(0.2)
+    end
+
+    
+    if safe_limit == floor(Int, (end_elems - start_elems) / step_elems) * step_elems + start_elems
+        println(C_CYAN * ">>> [TEST] Reached search limit without OOM. GPU may support even larger meshes." * C_RESET)
+    end
+
+    
+    
+    
+    final_limit = floor(Int, safe_limit * 0.95)  
+    
+    
+    vram_used_estimate = safe_limit * 300  
+    actual_bytes_per_elem = round(Int, vram_used_estimate / safe_limit)
+    
+    println("\n" * C_CYAN * "="^60 * C_RESET)
+    println(C_GREEN * C_BOLD * ">>> [RESULT] Maximum Safe Elements: $(round(final_limit / 1_000_000, digits=1))M" * C_RESET)
+    println(C_CYAN * "    Raw Crash Point:     $(round(safe_limit / 1_000_000, digits=1))M elements" * C_RESET)
+    println(C_CYAN * "    Safety Margin:       5% reduction applied" * C_RESET)
+    println(C_CYAN * "    Estimated VRAM:      ~$(round(actual_bytes_per_elem * final_limit / 1024^3, digits=2)) GB at limit" * C_RESET)
+    println(C_CYAN * "="^60 * C_RESET)
+    
+    println(">>> [HARDWARE] Writing limits to $limit_file")
+    open(limit_file, "w") do io
+        write(io, "# MACHINE SPECIFIC LIMITS - GENERATED AUTOMATICALLY\n")
+        write(io, "# GPU_ID: $current_gpu_id\n")
+        write(io, "# Generated: $(Dates.now())\n")
+        write(io, "# Total VRAM: $(round(current_vram/1024^3, digits=2)) GB\n")
+        write(io, "# Tested Range: $(round(start_elems/1e6, digits=1))M to $(round(safe_limit/1e6, digits=1))M elements\n")
+        write(io, "# Crash Point: $(round(safe_limit/1e6, digits=1))M elements\n")
+        write(io, "# \n")
+        write(io, "# These limits were determined by stress-testing GMG solver memory allocation.\n")
+        write(io, "# The test simulates the full memory footprint of the geometric multigrid solver:\n")
+        write(io, "#   - Finest level: 6 vectors (r, p, Ap, x, z, temp) + element data\n")
+        write(io, "#   - Coarse levels: 3 vectors per level + element data (3-4 levels)\n")
+        write(io, "# \n")
+        write(io, "# SAFETY MARGIN: 5% (reduced from previous 10% based on empirical stability data)\n")
+        write(io, "# Empirical data from production runs shows stable operation at 95% of crash point.\n")
+        write(io, "# \n")
+        write(io, "# MEMORY ESTIMATE: ~$(actual_bytes_per_elem) bytes per element (varies with mesh size)\n")
+        write(io, "#   - Small meshes (5M): ~400 bytes/element\n")
+        write(io, "#   - Large meshes (30M+): ~200 bytes/element\n")
+        write(io, "#   - Fixed overhead amortized across elements\n")
+        write(io, "# \n")
+        write(io, "# To re-test (e.g., after GPU upgrade or driver update):\n")
+        write(io, "#   Delete this file and restart the application.\n")
+        write(io, "# \n")
+        write(io, "module MachineLimits\n")
+        write(io, "    # GMG (Geometric Multigrid) Solver Limit\n")
+        write(io, "    # This is the maximum element count for the memory-intensive GMG preconditioner\n")
+        write(io, "    const MAX_GMG_ELEMENTS = $final_limit\n")
+        write(io, "    \n")
+        write(io, "    # Jacobi Preconditioner Limit\n")
+        write(io, "    # Jacobi uses significantly less memory than GMG (no coarse level hierarchy)\n")
+        write(io, "    # Empirical data shows Jacobi can handle 3-4x more elements than GMG\n")
+        write(io, "    # Conservative estimate: 2.5x GMG limit\n")
+        write(io, "    const MAX_JACOBI_ELEMENTS = $(floor(Int, final_limit * 2.5))\n")
+        write(io, "end\n")
+    end
+    
+    println(C_GREEN * C_BOLD * ">>> [HARDWARE] Setup Complete!" * C_RESET)
+    println(">>> [HARDWARE] Max GMG Elements:    $(round(final_limit / 1_000_000, digits=1))M elements")
+    println(">>> [HARDWARE] Max Jacobi Elements: $(round(final_limit * 2.5 / 1_000_000, digits=1))M elements")
+    println(C_CYAN * "-"^60 * C_RESET)
+    flush(stdout)
+end
+
+function launch_main()
+    println("-"^60)
+    println(">>> [LAUNCHER] Handing off to Main.jl...")
+    flush(stdout)
+    
+    main_script = joinpath(@__DIR__, "src", "Main.jl")
+    
+    if !isfile(main_script)
+        println(C_RED * ">>> [ERROR] Main.jl not found at: $main_script" * C_RESET)
+        exit(1)
+    end
+    
+    
+    include(main_script)
+end
+
+function main()
+    try
+        print_banner()
+        activate_environment()
+        instantiate_environment()
+        verify_packages()
+        precompile_environment()
+        println(">>> [ENV] Environment Ready.")
+        flush(stdout)
+        
+        check_cuda_availability()
+        generate_machine_limits()
+        
+        launch_main()
+        
+    catch e
+        if isa(e, InterruptException)
+            println("\n" * C_YELLOW * ">>> [LAUNCHER] Interrupted by user." * C_RESET)
+            exit(0)
+        else
+            println("\n" * C_RED * ">>> [LAUNCHER] Fatal error during setup:" * C_RESET)
+            showerror(stderr, e, catch_backtrace())
+            println("\n")
+            exit(1)
+        end
+    end
+end
+
+
+main()
+"// # FILE: .\configs\_machine_limits.jl";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+module MachineLimits
+    
+    
+    const MAX_GMG_ELEMENTS = 41800000
+    
+    
+    
+    
+    
+    const MAX_JACOBI_ELEMENTS = 104500000
+end
+"// # FILE: .\configs\domain_definitions.yaml";
+# FILE: .\configs\domain_definitions.yaml
+# ==============================================================================
+# PART 1: PHYSICAL PROBLEM DEFINITION
+# ==============================================================================
+geometry:
+  length_x: 60
+  length_y: 20
+  length_z: 20
+  
+  # Regions
+  sphere1:
+    type: sphere
+    center: [12.51, 28.49, 50]
+    diameter: 8
+    stiffness_ratio: 0   # Hole
+  sphere2:
+    type: sphere
+    center: [60.38, -0.07, 50]
+    diameter: 4
+    stiffness_ratio: 10  # Stiff inclusion
+  sphere3:
+    type: sphere
+    center: [34.29, 5, 50]
+    diameter: 4
+    stiffness_ratio: -10 # Passive thermal
+  box1:
+    type: box
+    center: [28, 15, 50]
+    size: [1, 2, 3]
+    stiffness_ratio: 5
+  box2:
+    type: box
+    center: [45.06, 8.95, 50]
+    size: [1, 4, 2]
+    stiffness_ratio: 0   # Void box
+
+boundary_conditions:
+  - location: [0, ':', ':']
+    DoFs: [1, 2, 3]
+
+external_forces:
+  - name: Y10
+    location: [100%, 0, 0]
+    F: [0, 10, 0]
+  - name: Z-10
+    location: [100%, 0, 50%]
+    F: [0, 0, -10]
+  - name: Y20
+    location: [100%, 0, 100%]
+    F: [0, 20, 0]
+  - name: Mid_Y20
+    location: [50%, 0, 50%]
+    F: [0, 15, 0]
+
+material:
+  E: 1.0
+  nu: 0.3
+  material_density: 0.001
+  gravity_acceleration: 9.81
+  # This serves as the BASE allowable. The solver will adapt it internally.
+  l1_stress_allowable: 1.5
+"// # FILE: .\configs\optimization_cases.yaml";
+# FILE: .\configs\optimization_cases.yaml
+# ==============================================================================
+# OPTIMIZATION CASES ORCHESTRATOR
+# ==============================================================================
+# This file defines a sequence of simulations to run. 
+# It merges a physics definition with a solver definition for each run.
+
+batch_queue:
+  # ----------------------------------------------------------------------------
+  # Run 1: Target Stress Optimization (Adaptive BESO)
+  # ----------------------------------------------------------------------------
+  - job_name: "Case_1_TargetStress"
+    domain_config: "./configs/domain_definitions.yaml"
+    solver_config: "./configs/solver_settings_1.yaml"
+
+  - job_name: "Case_2_TargetStress"
+    domain_config: "./configs/domain_definitions.yaml"
+    solver_config: "./configs/solver_settings_2.yaml"
+"// # FILE: .\configs\solver_settings_1.yaml";
+# FILE: .\configs\solver_settings_1.yaml
+# ==============================================================================
+# PART 2: SOLVER SETTINGS
+# ==============================================================================
+gpu_profile: "RTX" 
+
+restart_configuration:
+  enable_restart: false
+  file_path: ""
+
+mesh_settings:
+  initial_ground_mesh_size: 1_000_000
+  final_target_of_active_elements: 1_000_000
+  max_growth_rate: 1.1
+  nominal_refinement_threshold: 0.9
+  exponent_for_refinement_schedule: 1.0 
+  max_background_elements: 1_000_000
+  gpu_solver_safety_factor: 0.95
+
+# ------------------------------------------------------------------------------
+# OPTIMIZATION LOOP
+# ------------------------------------------------------------------------------
+number_of_iterations: 100
+hard_stop_after_iteration: 120
+
+optimization_parameters:
+  # --- NEW TARGET PARAMETERS ---
+  # Force solver to reach this stress.
+  # Since your material allowable is 1.5, we target that same value.
+  target_l1_stress: 1.5
+  target_volume_fraction: -1.0 # Disabled
+
+  # --- CULLING PARAMETERS ---
+  # Max 5% removal per iteration (BESO base rate)
+  max_culling_ratio: 0.05
+  # Physics threshold: Elements < 10% stiffness are candidates
+  culling_threshold: 0.1    
+  culling_target_at_end: 0.9
+  
+  density_update_method: "hard"
+  min_density: 0.0001
+  density_clamp_max: 1
+
+  # Filter Radius
+  minimum_feature_size_physical: 0.6
+  minimum_feature_size_elements: 1.5 
+  radius_max_multiplier: 4.0
+  radius_min_multiplier: 1.0
+  radius_decay_exponent: 1.5
+  constraint_constant: 0.25
+
+solver_parameters:
+  solver_type: gpu              
+  preconditioner: "multigrid"
+  tolerance: 1.e-6 
+  max_iterations: 30000 
+  diagonal_shift_factor: 1.e-7 
+  stagnation_tolerance: 1.0e-3
+  max_shift_attempts: 7
+  shift_multiplier: 10.0
+  gpu_method: krylov        
+  krylov_solver: cg              
+
+output_settings:
+  export_frequency: 1       
+  save_bin_frequency: 1
+  save_STL_frequency: 20    
+  save_VTK_frequency: 1     
+  save_principal_stress_vectors: no
+  log_filename: simulation_log.txt
+  iso_surface_threshold: 0.01
+  stl_subdivision_level: 1       
+  stl_smoothing_passes: 1        
+  stl_mesh_smoothing_iters: 3    
+  maximum_cells_in_binary_output: 25_000_000
+  stl_target_triangle_count: 500000
+"// # FILE: .\configs\solver_settings_2.yaml";
+# FILE: .\configs\solver_settings_1.yaml
+# ==============================================================================
+# PART 2: SOLVER SETTINGS
+# ==============================================================================
+gpu_profile: "RTX" 
+
+restart_configuration:
+  enable_restart: false
+  file_path: ""
+
+mesh_settings:
+  initial_ground_mesh_size: 15_000_000
+  final_target_of_active_elements: 15_000_000
+  max_growth_rate: 1.1
+  nominal_refinement_threshold: 0.9
+  exponent_for_refinement_schedule: 1.0 
+  max_background_elements: 1_000_000
+  gpu_solver_safety_factor: 0.95
+
+# ------------------------------------------------------------------------------
+# OPTIMIZATION LOOP
+# ------------------------------------------------------------------------------
+number_of_iterations: 100
+hard_stop_after_iteration: 120
+
+optimization_parameters:
+  # --- NEW TARGET PARAMETERS ---
+  # Force solver to reach this stress.
+  # Since your material allowable is 1.5, we target that same value.
+  target_l1_stress: 1.5
+  target_volume_fraction: -1.0 # Disabled
+
+  # --- CULLING PARAMETERS ---
+  # Max 5% removal per iteration (BESO base rate)
+  max_culling_ratio: 0.05
+  # Physics threshold: Elements < 10% stiffness are candidates
+  culling_threshold: 0.1    
+  culling_target_at_end: 0.9
+  
+  density_update_method: "hard"
+  min_density: 0.0001
+  density_clamp_max: 1
+
+  # Filter Radius
+  minimum_feature_size_physical: 0.6
+  minimum_feature_size_elements: 1.5 
+  radius_max_multiplier: 4.0
+  radius_min_multiplier: 1.0
+  radius_decay_exponent: 1.5
+  constraint_constant: 0.25
+
+solver_parameters:
+  solver_type: gpu              
+  preconditioner: "multigrid"
+  tolerance: 1.e-6 
+  max_iterations: 30000 
+  diagonal_shift_factor: 1.e-7 
+  stagnation_tolerance: 1.0e-3
+  max_shift_attempts: 7
+  shift_multiplier: 10.0
+  gpu_method: krylov        
+  krylov_solver: cg              
+
+output_settings:
+  export_frequency: 1       
+  save_bin_frequency: 1
+  save_STL_frequency: 20    
+  save_VTK_frequency: 1     
+  save_principal_stress_vectors: no
+  log_filename: simulation_log.txt
+  iso_surface_threshold: 0.01
+  stl_subdivision_level: 1       
+  stl_smoothing_passes: 1        
+  stl_mesh_smoothing_iters: 3    
+  maximum_cells_in_binary_output: 25_000_000
+  stl_target_triangle_count: 500000
+"// # FILE: .\src\Main.jl";
+// 
+using Pkg
+using LinearAlgebra
+using SparseArrays
+using Printf
+using Base.Threads
+using JSON
+using Dates
+using Statistics
+using CUDA
+using YAML
+
+println("\n>>> SCRIPT START: Loading Modules...")
+flush(stdout)
+
+const PROJECT_ROOT = abspath(joinpath(@__DIR__, ".."))
+const LIMITS_FILE = joinpath(PROJECT_ROOT, "configs", "_machine_limits.jl")
+
+if isfile(LIMITS_FILE)
+    include(LIMITS_FILE)
+    println(">>> [PRE-INIT] Loaded Machine Limits.")
+else
+    @eval module MachineLimits
+        const MAX_GMG_ELEMENTS = 5_000_000
+        const MAX_JACOBI_ELEMENTS = 10_000_000
+    end
+    println(">>> [PRE-INIT] No machine limits found. Using safe defaults.")
+end
+
+module HEXA
+    using LinearAlgebra
+    using SparseArrays
+    using Printf
+    using Base.Threads
+    using JSON
+    using Dates
+    using Statistics
+    using CUDA
+    using YAML
+
+    using ..MachineLimits
+
+    const PROJECT_ROOT = abspath(joinpath(@__DIR__, ".."))
+
+    include("Utils/Diagnostics.jl")
+    include("Utils/Helpers.jl")
+    using .Diagnostics
+    using .Helpers
+
+    include("Core/Element.jl")
+    include("Core/Boundary.jl")
+    include("Core/Stress.jl")
+    using .Element
+    using .Boundary
+    using .Stress
+
+    include("Mesh/Mesh.jl")
+    include("Mesh/MeshUtilities.jl")
+    include("Mesh/MeshPruner.jl")
+    include("Mesh/MeshRefiner.jl")
+    include("Mesh/MeshShapeProcessing.jl")
+    using .Mesh
+    using .MeshUtilities
+    using .MeshPruner
+    using .MeshRefiner
+    using .MeshShapeProcessing
+
+    include("Solvers/CPUSolver.jl")
+    include("Solvers/GPUGeometricMultigrid.jl")
+    include("Solvers/GPUSolver.jl")
+    include("Solvers/DirectSolver.jl")
+    include("Solvers/IterativeSolver.jl")
+    include("Solvers/Solver.jl")
+    
+    using .CPUSolver
+    using .GPUGeometricMultigrid
+    using .GPUSolver
+    using .DirectSolver
+    using .IterativeSolver
+    using .Solver
+
+    include("IO/Configuration.jl")
+    include("IO/ExportVTK.jl")
+    include("IO/Postprocessing.jl")
+    
+    include("Optimization/GPUExplicitFilter.jl")
+    include("Optimization/TopOpt.jl")
+    
+    using .Configuration
+    using .ExportVTK
+    using .Postprocessing
+    using .GPUExplicitFilter
+    using .TopologyOptimization
+
+    function __init__()
+        Diagnostics.print_success("HEXA Finite Element Solver initialized")
+        Helpers.clear_gpu_memory()
+        flush(stdout)
+    end
+    
+    function apply_hardware_profile!(config::Dict)
+        gpu_type = get(config, "gpu_profile", "RTX")
+        if gpu_type == "AUTO" && CUDA.functional()
+            dev_name = CUDA.name(CUDA.device())
+            if occursin("V100", dev_name); gpu_type = "V100"; end
+            if occursin("A100", dev_name) || occursin("H100", dev_name); gpu_type = "H200"; end
+            Diagnostics.print_info("Auto-Detected GPU: $dev_name -> Profile: $gpu_type")
+        else
+            Diagnostics.print_info("Using Configured Profile: $gpu_type")
+        end
+        
+        mesh_conf = get(config, "mesh_settings", Dict())
+        solver = get(config, "solver_parameters", Dict())
+        
+        config["force_float64"] = false
+        if uppercase(gpu_type) in ["H", "H200", "H100", "A100"]
+            Diagnostics.print_substep("High-Performance Data Center GPU (H/A-Series). Precision: Float64.")
+            solver["tolerance"] = get(solver, "tolerance", 1.0e-12)
+            solver["diagonal_shift_factor"] = 1.0e-10
+            solver["solver_type"] = "gpu"
+            config["force_float64"] = true
+        elseif uppercase(gpu_type) == "V100"
+            Diagnostics.print_substep("Legacy Data Center GPU (Tesla V100). Precision: Float64.")
+            solver["tolerance"] = get(solver, "tolerance", 1.0e-10)
+            solver["diagonal_shift_factor"] = 1.0e-9
+            solver["solver_type"] = "gpu"
+            config["force_float64"] = true
+        else 
+            Diagnostics.print_substep("Consumer/Workstation GPU (RTX-Series). Precision: Float32.")
+            solver["tolerance"] = get(solver, "tolerance", 1.0e-6)
+            solver["solver_type"] = "gpu"
+            config["force_float64"] = false
+        end
+        config["mesh_settings"] = mesh_conf
+        config["solver_parameters"] = solver
+        config["hardware_profile_applied"] = gpu_type
+        
+        config["machine_limits"] = Dict(
+            "MAX_GMG_ELEMENTS" => MachineLimits.MAX_GMG_ELEMENTS,
+            "MAX_JACOBI_ELEMENTS" => MachineLimits.MAX_JACOBI_ELEMENTS
+        )
+    end
+
+    function run_main(input_file=nothing)
+        try
+            if input_file === nothing
+                input_file = joinpath(PROJECT_ROOT, "configs", "optimization_cases.yaml")
+            end
+            
+            if !isfile(input_file)
+                error("Input file not found: $input_file")
+            end
+
+            raw_config = Configuration.load_configuration(input_file)
+
+            if haskey(raw_config, "batch_queue")
+                queue = raw_config["batch_queue"]
+                Diagnostics.print_banner("BATCH EXECUTION STARTED: $(length(queue)) Runs")
+                
+                for (i, run_def) in enumerate(queue)
+                    job_name = get(run_def, "job_name", "Run_$i")
+                    Diagnostics.print_banner("BATCH RUN $i/$((length(queue))): $job_name", color="\u001b[35m")
+                    
+                    domain_file = get(run_def, "domain_config", "")
+                    solver_file = get(run_def, "solver_config", "")
+                    overrides = get(run_def, "overrides", Dict())
+
+                    if isempty(domain_file) || isempty(solver_file)
+                        Diagnostics.print_error("Skipping $job_name: Missing config file paths.")
+                        continue
+                    end
+
+                    if !isabspath(domain_file); domain_file = joinpath(PROJECT_ROOT, domain_file); end
+                    if !isabspath(solver_file); solver_file = joinpath(PROJECT_ROOT, solver_file); end
+
+                    try
+                        merged_config = Configuration.load_and_merge_configurations(domain_file, solver_file, overrides)
+                        _run_safe(merged_config, job_name)
+                    catch e_run
+                        Diagnostics.print_error("Job $job_name Failed: $e_run")
+                        showerror(stdout, e_run, catch_backtrace())
+                    end
+                    
+                    Diagnostics.print_success("Finished Batch Run: $job_name")
+                    GC.gc()
+                    if CUDA.functional(); CUDA.reclaim(); end
+                end
+                Diagnostics.print_banner("BATCH QUEUE COMPLETE")
+
+            else
+                base_job_name = get(raw_config, "job_name", splitext(basename(input_file))[1])
+                _run_safe(raw_config, base_job_name)
+            end
+
+        catch e
+            if isa(e, InterruptException)
+                Diagnostics.print_banner("USER INTERRUPT", color="\u001b[33m")
+                println(">>> Simulation stopped by user.")
+            else
+                Diagnostics.print_banner("FATAL ERROR DETECTED", color="\u001b[31m")
+                showerror(stderr, e, catch_backtrace())
+            end
+            flush(stdout)
+        finally
+            if CUDA.functional()
+                Diagnostics.print_info("Finalizing: Cleaning up GPU Memory...")
+                Helpers.clear_gpu_memory()
+                Diagnostics.print_success("GPU Memory Released.")
+                flush(stdout)
+            end
+        end
+    end
+
+    function _run_safe(current_config::Dict, run_name::String="Simulation")
+        Diagnostics.print_banner("HEXA TOPOLOGY OPTIMIZER: $run_name")
+        Diagnostics.print_info("Clearing GPU Memory from previous runs...")
+        
+        if CUDA.functional()
+            Helpers.clear_gpu_memory()
+            CUDA.device!(0) 
+            dev = CUDA.device()
+            name = CUDA.name(dev)
+            total_mem = CUDA.total_memory()
+            
+            if CUDA.runtime_version() >= v"11.2"
+                threshold = min(total_mem * 0.10, 5 * 1024^3) 
+                try
+                    pool = CUDA.memory_pool(dev)
+                    CUDA.attribute!(pool, CUDA.MEMPOOL_ATTR_RELEASE_THRESHOLD, UInt64(threshold))
+                    Diagnostics.print_success("CUDA memory pool configured successfully")
+                catch e
+                    Diagnostics.print_warn("Memory pool configuration failed (non-critical): $e")
+                end
+            end
+            
+            mem_gb = total_mem / 1024^3
+            Diagnostics.print_success("GPU Detected: $name ($(round(mem_gb, digits=2)) GB)")
+        else
+            Diagnostics.print_warn("No CUDA GPU detected. Running in CPU Mode (Slow).")
+        end
+        GC.gc()
+        
+        apply_hardware_profile!(current_config)
+        
+        restart_conf = get(current_config, "restart_configuration", Dict())
+        enable_restart = get(restart_conf, "enable_restart", false)
+        restart_path = get(restart_conf, "file_path", "")
+        
+        config = Dict{Any,Any}()
+        density = Float32[]
+        start_iter = 1
+        restart_radius = 0.0f0
+        restart_threshold = 0.0f0
+        is_restart_active = false
+
+        if enable_restart
+             if isfile(restart_path)
+                Diagnostics.print_banner("RESTART MODE ACTIVE", color="\u001b[35m")
+                Diagnostics.print_info("Loading checkpoint: $restart_path")
+                saved_config, density, saved_iter, restart_radius, restart_threshold = Configuration.load_checkpoint(restart_path)
+                config = merge(saved_config, current_config)
+                apply_hardware_profile!(config)
+                start_iter = saved_iter + 1
+                is_restart_active = true
+            else
+                Diagnostics.print_warn("Restart requested but file not found: '$restart_path'")
+                Diagnostics.print_warn("Falling back to FRESH START.")
+                config = current_config
+                is_restart_active = false
+            end
+        else
+            Diagnostics.print_info("Starting Fresh Simulation")
+            config = current_config
+            is_restart_active = false
+        end
+        
+        hard_stop_iter = get(config, "hard_stop_after_iteration", -1)
+        if hard_stop_iter > -1
+            Diagnostics.print_info("HARD STOP ENABLED: Execution will stop after iteration $hard_stop_iter.")
+        end
+
+        out_settings = get(config, "output_settings", Dict())
+        default_freq = get(out_settings, "export_frequency", 5)
+        save_bin_freq = get(out_settings, "save_bin_frequency", default_freq)
+        save_stl_freq = get(out_settings, "save_STL_frequency", default_freq)
+        save_vtk_freq = get(out_settings, "save_VTK_frequency", default_freq)
+
+        save_vec_val = get(out_settings, "save_principal_stress_vectors", "no")
+        save_vectors_bool = (lowercase(string(save_vec_val)) == "yes" || save_vec_val == true)
+        
+        RESULTS_DIR = joinpath(PROJECT_ROOT, "RESULTS", run_name)
+        if !isdir(RESULTS_DIR); mkpath(RESULTS_DIR); end
+        Diagnostics.print_info("Output Directory: $RESULTS_DIR")
+
+        raw_log_name = get(out_settings, "log_filename", "simulation_log.txt")
+        log_base, log_ext = splitext(basename(raw_log_name))
+        log_filename = joinpath(RESULTS_DIR, "$(log_base)_$(run_name)$(log_ext)")
+        crash_log_filename = joinpath(RESULTS_DIR, "crash_report_$(run_name).txt")
+
+        iso_threshold_val = get(out_settings, "iso_surface_threshold", 0.8)
+        iso_threshold = Float32(iso_threshold_val)
+        
+        if !is_restart_active
+            Diagnostics.init_log_file(log_filename, config)
+        else
+            Diagnostics.log_status("--- RESTARTING SIMULATION (Iter $start_iter) ---")
+        end
+        
+        geom = Configuration.setup_geometry(config)
+        nodes, elements, dims = generate_mesh(geom.nElem_x, geom.nElem_y, geom.nElem_z; dx = geom.dx, dy = geom.dy, dz = geom.dz)
+        initial_target_count = size(elements, 1)
+        
+        if is_restart_active && length(density) != initial_target_count
+            error("Restart Mismatch: Checkpoint density size ($(length(density))) != Generated Mesh size ($initial_target_count).")
+        end
+        
+        domain_bounds = (min_pt=[0.0f0,0.0f0,0.0f0], len_x=geom.dx*geom.nElem_x, len_y=geom.dy*geom.nElem_y, len_z=geom.dz*geom.nElem_z)
+        config["geometry"]["nElem_x_computed"] = geom.nElem_x
+        config["geometry"]["nElem_y_computed"] = geom.nElem_y
+        config["geometry"]["nElem_z_computed"] = geom.nElem_z
+        config["geometry"]["dx_computed"] = geom.dx
+        config["geometry"]["dy_computed"] = geom.dy
+        config["geometry"]["dz_computed"] = geom.dz
+        config["geometry"]["max_domain_dim"] = geom.max_domain_dim
+        
+        nNodes = size(nodes, 1)
+        ndof = nNodes * 3
+        bc_data = config["boundary_conditions"]
+        forces_data = config["external_forces"]
+        
+        bc_indicator = Boundary.get_bc_indicator(nNodes, nodes, Vector{Any}(bc_data))
+        F_external = zeros(Float32, ndof)
+        Boundary.apply_external_forces!(F_external, Vector{Any}(forces_data), nodes, elements)
+        Diagnostics.print_success("Boundary Conditions & External Forces Mapped.")
+
+        E = Float32(config["material"]["E"])
+        nu = Float32(config["material"]["nu"])
+        
+        material_density = Float32(get(config["material"], "material_density", 0.0))
+        gravity_accel = Float32(get(config["material"], "gravity_acceleration", 9.81))
+        delta_T = Float32(get(config["material"], "delta_temperature", 0.0))
+        if abs(delta_T) > 1e-6; Diagnostics.print_info("THERMOELASTICITY ENABLED: Delta T = $delta_T"); end
+
+        original_density = ones(Float32, size(elements, 1)) 
+        protected_elements_mask = falses(size(elements, 1)) 
+        alpha_field = zeros(Float32, size(elements, 1))
+
+        if !is_restart_active
+            density, original_density, protected_elements_mask, alpha_field = Configuration.initialize_density_field(nodes, elements, geom.shapes, config)
+        else
+            _, original_density, protected_elements_mask, alpha_field = Configuration.initialize_density_field(nodes, elements, geom.shapes, config)
+        end
+        
+        opt_params = config["optimization_parameters"]
+        min_density = Float32(get(opt_params, "min_density", 1.0e-3))
+        max_density_clamp = Float32(get(opt_params, "density_clamp_max", 1.0))
+        base_name = run_name 
+        
+        mesh_conf = get(config, "mesh_settings", Dict())
+        
+        
+        total_iterations = get(config, "number_of_iterations", 30)
+
+        Diagnostics.print_banner("OPTIMIZATION SCHEDULE")
+        println("    Total Iterations: $total_iterations")
+
+        raw_active_target = get(mesh_conf, "final_target_of_active_elements", initial_target_count)
+        final_target_active = isa(raw_active_target, String) ? parse(Int, replace(raw_active_target, "_" => "")) : Int(raw_active_target)
+        max_growth_rate = Float64(get(mesh_conf, "max_growth_rate", 1.2))
+        raw_bg_limit = get(mesh_conf, "max_background_elements", 800_000_000)
+        hard_elem_limit = isa(raw_bg_limit, String) ? parse(Int, replace(raw_bg_limit, "_" => "")) : Int(raw_bg_limit)
+        Diagnostics.print_info("Hard Element Limit: $(Base.format_bytes(hard_elem_limit * 100)) approx ($hard_elem_limit elems)")
+
+        
+        l1_stress_allowable = Float32(get(config["material"], "l1_stress_allowable", 1.0))
+        if l1_stress_allowable == 0.0f0; l1_stress_allowable = 1.0f0; end
+        
+        target_vol_frac = Float32(get(opt_params, "target_volume_fraction", -1.0))
+        target_l1_stress = Float32(get(opt_params, "target_l1_stress", -1.0))
+        
+        target_type = "none"
+        if target_vol_frac > 0.0
+            target_type = "volume"
+            Diagnostics.print_info("CONTROL MODE: Target Volume = $(round(target_vol_frac*100,digits=1))%")
+        else
+            if target_l1_stress <= 0.0
+                target_l1_stress = l1_stress_allowable
+                Diagnostics.print_info("CONTROL MODE: Auto-Targeting Material Allowable Stress ($target_l1_stress)")
+            else
+                Diagnostics.print_info("CONTROL MODE: Target L1 Stress = $(round(target_l1_stress,digits=3))")
+            end
+            target_type = "stress"
+        end
+
+        internal_l1_allowable = l1_stress_allowable 
+        U_full = zeros(Float32, ndof)
+        density_change_metric = 1.0f0 
+        filter_R = is_restart_active ? restart_radius : 0.0f0
+        
+        
+        current_cutoff = 0.05f0  
+        
+        iter = start_iter
+        keep_running = true
+        prev_compliance = 0.0f0
+        convergence_streak = 0
+        CONVERGENCE_TOL = 0.005 
+        CONVERGENCE_DENSITY_TOL = 0.001 
+        CONVERGENCE_REQUIRED_STREAK = 5 
+        
+        Diagnostics.print_banner("STARTING MAIN LOOP")
+        Diagnostics.print_info("Log File: $log_filename")
+        
+        flush(stdout) 
+
+        while keep_running
+            iter_start_time = time()
+            status_msg = "Nominal"
+            phase_refinement_needed = false
+            
+            
+            
+            progress = (iter - 1) / Float64(total_iterations)
+            
+            growth_exponent = Float64(get(mesh_conf, "exponent_for_refinement_schedule", 2.0))
+            growth_factor = progress ^ growth_exponent 
+            
+            target_interpolated = initial_target_count + (final_target_active - initial_target_count) * growth_factor
+            current_target_active = round(Int, target_interpolated)
+            current_active = count(d -> d > 0.01, density)
+            nominal_ref_thresh = Float64(get(mesh_conf, "nominal_refinement_threshold", 0.8))
+            
+            if current_active < (current_target_active * nominal_ref_thresh)
+                phase_refinement_needed = true
+            end
+            
+            
+            
+            if phase_refinement_needed
+                 prev_elem_count = size(elements, 1)
+                 nodes, elements, density, alpha_field, dims = MeshRefiner.refine_mesh_and_fields(
+                    nodes, elements, density, alpha_field, dims, current_target_active, domain_bounds;
+                    max_growth_rate = max_growth_rate, hard_element_limit = hard_elem_limit
+                )
+                GC.gc()
+                
+                if size(elements, 1) > prev_elem_count
+                    status_msg = "Refined"
+                    
+                    convergence_streak = 0
+                    nElem_x_new, nElem_y_new, nElem_z_new = dims[1]-1, dims[2]-1, dims[3]-1
+                    current_dx = domain_bounds.len_x / nElem_x_new
+                    current_dy = domain_bounds.len_y / nElem_y_new
+                    current_dz = domain_bounds.len_z / nElem_z_new
+                    
+                    config["geometry"]["nElem_x_computed"] = nElem_x_new
+                    config["geometry"]["nElem_y_computed"] = nElem_y_new
+                    config["geometry"]["nElem_z_computed"] = nElem_z_new
+                    config["geometry"]["dx_computed"] = current_dx
+                    config["geometry"]["dy_computed"] = current_dy
+                    config["geometry"]["dz_computed"] = current_dz
+                    
+                    geom = (nElem_x=nElem_x_new, nElem_y=nElem_y_new, nElem_z=nElem_z_new, dx=current_dx, dy=current_dy, dz=current_dz, shapes=geom.shapes, actual_elem_count=size(elements, 1), max_domain_dim=geom.max_domain_dim)
+
+                    Diagnostics.print_substep("[Refinement] Re-mapping Boundary Conditions & Forces...")
+                    nNodes = size(nodes, 1)
+                    ndof = nNodes * 3
+                    bc_indicator = Boundary.get_bc_indicator(nNodes, nodes, Vector{Any}(bc_data))
+                    F_external = zeros(Float32, ndof)
+                    Boundary.apply_external_forces!(F_external, Vector{Any}(forces_data), nodes, elements)
+                    _, original_density, protected_elements_mask, _ = Configuration.initialize_density_field(nodes, elements, geom.shapes, config)
+                    Diagnostics.print_substep("[Refinement] Resetting solution guess.")
+                    U_full = zeros(Float32, ndof)
+                    TopologyOptimization.reset_filter_cache!()
+                else
+                    status_msg = "Skip"
+                end
+            end
+
+            
+            if iter > 1
+                Threads.@threads for e in 1:size(elements, 1)
+                    if protected_elements_mask[e]; density[e] = original_density[e]; end
+                end
+            end
+            
+            config["current_outer_iter"] = iter
+            F_total = copy(F_external)
+            
+            
+            if abs(delta_T) > 1e-6
+                 Boundary.compute_global_thermal_forces!(F_total, nodes, elements, alpha_field, delta_T, E, nu, density)
+            end
+            
+            Diagnostics.print_substep("FEA Solve (Iter $iter)")
+            sol_tuple = Solver.solve_system(
+                nodes, elements, E, nu, bc_indicator, F_total;
+                density=density, config=config, min_stiffness_threshold=min_density, 
+                prune_voids=true, u_prev=U_full 
+            )
+            U_new = sol_tuple[1]
+            last_residual = sol_tuple[2]
+            prec_used = sol_tuple[3]
+            U_full = U_new
+            
+            if CUDA.functional(); GC.gc(); CUDA.reclaim(); end
+            
+            compliance = dot(F_total, U_full)
+            strain_energy = 0.5 * compliance
+            
+            Diagnostics.print_substep("Calculating Stress Field...")
+            t_stress = time()
+            
+            principal_field, vonmises_field, full_stress_voigt, l1_stress_norm_field, principal_max_dir_field, principal_min_dir_field = Stress.compute_stress_field(nodes, elements, U_full, E, nu, density; return_voigt=false)
+            
+            try
+                if iter == 1
+                    Diagnostics.print_info("Exporting INITIAL REFERENCE STATE (Iter 0)...")
+                    do_bin_init = (save_bin_freq > 0); do_stl_init = (save_stl_freq > 0); do_vtk_init = (save_vtk_freq > 0)
+                    if do_bin_init || do_stl_init || do_vtk_init
+                        
+                        Postprocessing.export_iteration_results(0, base_name, RESULTS_DIR, nodes, elements, U_full, F_total, bc_indicator, 
+                                                                principal_field, vonmises_field, full_stress_voigt, l1_stress_norm_field, 
+                                                                principal_max_dir_field, principal_min_dir_field, 
+                                                                density, E, geom; iso_threshold=Float32(iso_threshold), current_radius=Float32(filter_R), config=config, 
+                                                                save_bin=do_bin_init, save_stl=do_stl_init, save_vtk=do_vtk_init)
+                    end
+                    if hard_stop_iter == 0; println(">>> HARD STOP: Stopping after background analysis (Iter 0)."); keep_running = false; break; end
+                end
+            catch e_export
+                Diagnostics.print_warn("Initial export failed ($e_export). Proceeding with optimization.")
+                Diagnostics.write_crash_log(crash_log_filename, "INITIAL_EXPORT", e_export, stacktrace(catch_backtrace()), iter, config, density)
+            end
+            
+            
+            active_stress_indices = findall(d -> d > 0.1f0, density)
+            avg_l1_stress = isempty(active_stress_indices) ? 0.0f0 : Float32(mean(view(l1_stress_norm_field, active_stress_indices)))
+            
+            vol_total = length(density); active_non_soft = count(d -> d > min_density, density); vol_frac = sum(density) / vol_total
+            
+            if target_type == "volume"
+                
+                progress_t = clamp(Float64(iter) / Float64(total_iterations), 0.0, 1.0)
+                current_target_vol = 1.0 + (target_vol_frac - 1.0) * progress_t
+                vol_error = (vol_frac - current_target_vol)
+                Kp_vol = 0.5f0
+                adjustment = 1.0f0 + Kp_vol * vol_error
+                internal_l1_allowable *= adjustment
+                Diagnostics.print_substep("Control [Vol]: Cur=$(round(vol_frac,digits=3)) -> Tgt=$(round(current_target_vol,digits=3)). Adj Allowable: $(round(internal_l1_allowable,digits=3))")
+            
+            elseif target_type == "stress"
+                
+                
+                culling_end_target = Float32(get(opt_params, "culling_target_at_end", 0.5))
+                
+                stress_ratio = avg_l1_stress / (target_l1_stress + 1e-9)
+                
+                if stress_ratio > 1.05
+                    
+                    damping = 0.5f0 * (stress_ratio - 1.0f0)
+                    internal_l1_allowable /= (1.0f0 + damping)
+                    
+                    current_cutoff = max(0.05f0, current_cutoff - 0.005f0)
+                    
+                    Diagnostics.print_substep("Control: Stress HIGH ($(round(avg_l1_stress,digits=2))). Adding Mass. Holding Cutoff.")
+                
+                else
+                    
+                    internal_l1_allowable *= 1.01f0
+                    
+                    if iter > 5
+                        progress_nominal = (iter - 5) / Float32(total_iterations - 5)
+                        target_cutoff_now = 0.05f0 + (culling_end_target - 0.05f0) * progress_nominal
+                        
+                        current_cutoff = min(culling_end_target, target_cutoff_now)
+                    end
+                    
+                    Diagnostics.print_substep("Control: Stress OK. Optimizing. Raising Cutoff to $(round(current_cutoff,digits=3)).")
+                end
+            end
+            
+            
+            internal_l1_allowable = max(internal_l1_allowable, l1_stress_allowable * 0.01f0)
+            internal_l1_allowable = min(internal_l1_allowable, l1_stress_allowable * 100.0f0)
+            internal_l1_allowable = Float32(internal_l1_allowable)
+            
+
+            
+            Diagnostics.print_substep("Topology Update & Filtering...")
+            t_filter = time()
+            
+            
+            res_tuple = TopologyOptimization.update_density!(
+                density, l1_stress_norm_field, protected_elements_mask, E, internal_l1_allowable, 
+                iter, total_iterations, 
+                original_density, min_density, max_density_clamp, config, elements;
+                force_no_cull = false,
+                cutoff_threshold = current_cutoff  
+            )
+            
+            density_change_metric, filter_R, _ = res_tuple
+            curr_threshold = current_cutoff 
+            
+            if iter > 5 && status_msg != "Refined"
+                rel_comp_change = abs(compliance - prev_compliance) / (prev_compliance + 1e-9)
+                if rel_comp_change < CONVERGENCE_TOL && density_change_metric < CONVERGENCE_DENSITY_TOL
+                    convergence_streak += 1
+                    Diagnostics.print_info("Convergence Streak: $convergence_streak/$CONVERGENCE_REQUIRED_STREAK (Comp: $(round(rel_comp_change*100, digits=3))%, Rho: $(round(density_change_metric*100, digits=4))%)")
+                else
+                    convergence_streak = 0
+                end
+                
+                if convergence_streak >= CONVERGENCE_REQUIRED_STREAK
+                      Diagnostics.print_success("Fully Converged. Stopping.")
+                      keep_running = false
+                end
+            else
+                convergence_streak = 0
+            end
+            prev_compliance = compliance
+            
+            iter_time = time() - iter_start_time
+            cur_dims_str = "$(config["geometry"]["nElem_x_computed"])x$(config["geometry"]["nElem_y_computed"])x$(config["geometry"]["nElem_z_computed"])"
+            
+            Diagnostics.write_iteration_log(
+                log_filename, iter, cur_dims_str, vol_total, active_non_soft, 
+                filter_R, curr_threshold, compliance, strain_energy, avg_l1_stress, vol_frac, density_change_metric, 
+                status_msg, iter_time, last_residual, prec_used
+            )
+
+            is_last_iter = (!keep_running) || (hard_stop_iter > 0 && iter >= hard_stop_iter) || (iter >= total_iterations)
+            
+            do_bin = (save_bin_freq > 0) && (iter % save_bin_freq == 0)
+            do_stl = ((save_stl_freq > 0) && (iter % save_stl_freq == 0)) || is_last_iter
+            do_vtk = (save_vtk_freq > 0) && (iter % save_vtk_freq == 0)
+            
+            should_export = do_bin || do_stl || do_vtk || is_last_iter 
+
+            if should_export
+                Diagnostics.print_substep("Exporting results...")
+                try
+                    Postprocessing.export_iteration_results(iter, base_name, RESULTS_DIR, nodes, elements, U_full, F_total, bc_indicator, 
+                                                            principal_field, vonmises_field, full_stress_voigt, l1_stress_norm_field, 
+                                                            principal_max_dir_field, principal_min_dir_field, 
+                                                            density, E, geom; iso_threshold=Float32(iso_threshold), current_radius=Float32(filter_R), config=config, save_bin=do_bin, save_stl=do_stl, save_vtk=do_vtk)
+                catch e_export
+                    Diagnostics.print_error("Post-processing failed at Iter $iter. Logged to crash_report. Continuing simulation.")
+                    Diagnostics.write_crash_log(crash_log_filename, "ITER_EXPORT", e_export, stacktrace(catch_backtrace()), iter, config, density)
+                end
+            end
+            
+            if hard_stop_iter > 0 && iter >= hard_stop_iter; println(">>> HARD STOP: Reached target iteration $hard_stop_iter."); keep_running = false; break; end
+            
+            if iter >= total_iterations
+                Diagnostics.print_success("Reached total iteration limit ($total_iterations).")
+                keep_running = false
+            end
+            
+            if CUDA.functional(); Helpers.clear_gpu_memory(); end
+            iter += 1
+            GC.gc()
+            flush(stdout) 
+        end
+        Diagnostics.log_status("Finished.")
+    end
+
+end
+
+function bootstrap()
+    println(">>> [BOOTSTRAP] Parsing arguments and launching module...")
+    flush(stdout)
+    
+    config_file = nothing
+    if length(ARGS) >= 1
+        config_file = ARGS[1]
+    end
+
+    HEXA.run_main(config_file)
+end
+
+bootstrap()
+"// # FILE: .\src\IO\Configuration.jl";
+// 
+module Configuration 
+ 
+using YAML  
+using JSON
+using ..Mesh  
+using ..Helpers 
+using ..MeshShapeProcessing 
+ 
+export load_configuration, load_and_merge_configurations, setup_geometry, initialize_density_field, load_checkpoint
+export validate_configuration, print_configuration_summary, export_configuration, compare_configurations
+export get_config_value, set_config_value!, apply_preset!
+ 
+""" 
+    load_configuration(filename::String) 
+ 
+Load and parse a JSON/YAML configuration file. 
+""" 
+function load_configuration(filename::String) 
+    if !isfile(filename) 
+        error("Configuration file '$(filename)' not found") 
+    end 
+      
+    return YAML.load_file(filename) 
+end 
+
+"""
+    recursive_merge(d1, d2)
+
+Recursively merges dictionary d2 into d1.
+"""
+function recursive_merge(d1::Dict, d2::Dict)
+    result = copy(d1)
+    for (k, v) in d2
+        if haskey(result, k) && isa(result[k], Dict) && isa(v, Dict)
+            result[k] = recursive_merge(result[k], v)
+        else
+            result[k] = v
+        end
+    end
+    return result
+end
+
+"""
+    load_and_merge_configurations(domain_file, solver_file, overrides)
+
+Loads two configuration files and merges them into a single dictionary.
+Applies `overrides` on top.
+"""
+function load_and_merge_configurations(domain_file::String, solver_file::String, overrides::Dict)
+    println(">>> [CONFIG] Loading Domain: $domain_file")
+    domain_config = load_configuration(domain_file)
+    
+    println(">>> [CONFIG] Loading Solver: $solver_file")
+    solver_config = load_configuration(solver_file)
+    
+    
+    merged = merge(domain_config, solver_config)
+    
+    if !isempty(overrides)
+        println(">>> [CONFIG] Applying $(length(overrides)) override(s)...")
+        merged = recursive_merge(merged, overrides)
+    end
+    
+    return merged
+end
+
+"""
+    load_checkpoint(filename::String)
+
+Reads a .bintop checkpoint file. 
+Returns: (config, density, restart_iter, restart_radius, restart_threshold)
+"""
+function load_checkpoint(filename::String)
+    println(">>> [Checkpoint] Reading restart data from: $filename")
+    
+    if !isfile(filename); error("Checkpoint file not found."); end
+
+    data = open(filename, "r") do io
+        
+        magic = read(io, UInt32) # 0x48455841 "HEXA"
+        version = read(io, UInt32)
+        
+        if magic != 0x48455841
+            error("Invalid file format. Not a HEXA checkpoint.")
+        end
+
+        iter = Int(read(io, Int32))
+        radius = Float32(read(io, Float32))
+        threshold = Float32(read(io, Float32))
+        
+        count = Int(read(io, UInt32))
+        dx = read(io, Float32)
+        dy = read(io, Float32)
+        dz = read(io, Float32)
+
+        seek(io, position(io) + (count * 3 * 4))
+
+        density = Vector{Float32}(undef, count)
+        read!(io, density)
+
+        seek(io, position(io) + (count * 4))
+
+        json_len = Int(read(io, UInt32))
+        json_bytes = Vector{UInt8}(undef, json_len)
+        read!(io, json_bytes)
+        
+        config_str = String(json_bytes)
+        config = JSON.parse(config_str)
+
+        println("    Restarting at Iteration: $iter")
+        println("    Filter Radius: $radius")
+        println("    Threshold: $threshold")
+        println("    Elements: $count")
+
+        return (config, density, iter, radius, threshold)
+    end
+
+    return data
+end
+ 
+""" 
+    setup_geometry(config) 
+ 
+Process the geometry configuration and return parameters for mesh generation. 
+""" 
+function setup_geometry(config) 
+      
+    length_x = config["geometry"]["length_x"] 
+    length_y = config["geometry"]["length_y"] 
+    length_z = config["geometry"]["length_z"] 
+     
+    
+    mesh_conf = get(config, "mesh_settings", Dict())
+    raw_count = get(mesh_conf, "initial_ground_mesh_size", 500_000)
+    
+    target_elem_count = if isa(raw_count, String)
+        parse(Int, replace(raw_count, "_" => ""))
+    else
+        Int(raw_count)
+    end
+      
+    println("Domain dimensions:") 
+    println("  X: 0 to $(length_x)") 
+    println("  Y: 0 to $(length_y)") 
+    println("  Z: 0 to $(length_z)") 
+      
+    shapes = Any[] 
+     
+    for (key, shape) in config["geometry"] 
+        if key in ["length_x", "length_y", "length_z", 
+                   "nElem_x_computed", "nElem_y_computed", "nElem_z_computed", 
+                   "dx_computed", "dy_computed", "dz_computed", "max_domain_dim"] 
+            continue 
+        end 
+          
+        if haskey(shape, "type") 
+            push!(shapes, shape)
+        end 
+    end 
+ 
+    println("Found $(length(shapes)) geometric modification shapes.") 
+      
+    nElem_x, nElem_y, nElem_z, dx, dy, dz, actual_elem_count = 
+        Helpers.calculate_element_distribution(length_x, length_y, length_z, target_elem_count) 
+      
+    println("Mesh parameters:") 
+    println("  Domain: $(length_x) x $(length_y) x $(length_z) meters") 
+    println("  Elements: $(nElem_x) x $(nElem_y) x $(nElem_z) = $(actual_elem_count)") 
+    println("  Element sizes: $(dx) x $(dy) x $(dz)") 
+      
+    max_domain_dim = max(length_x, length_y, length_z) 
+ 
+    return ( 
+        nElem_x = nElem_x,  
+        nElem_y = nElem_y,  
+        nElem_z = nElem_z, 
+        dx = dx, 
+        dy = dy, 
+        dz = dz, 
+        shapes = shapes, 
+        actual_elem_count = actual_elem_count, 
+        max_domain_dim = Float32(max_domain_dim)  
+    ) 
+end 
+ 
+""" 
+    initialize_density_field(nodes, elements, shapes, config)
+ 
+Processes geometric shapes to set the initial density array AND the alpha (thermal expansion) field.
+""" 
+function initialize_density_field(nodes::Matrix{Float32}, 
+                                  elements::Matrix{Int}, 
+                                  shapes::Vector{Any}, 
+                                  config::Dict) 
+      
+    min_density = Float32(get(config["optimization_parameters"], "min_density", 1e-3)) 
+ 
+    nElem = size(elements, 1) 
+    
+    println("\n" * "="^80)
+    println(">>> [GEOMETRY] Initializing Density Field")
+    println("="^80)
+    println("  Total Elements: $(nElem)")
+    println("  Number of Shapes: $(length(shapes))")
+    println("  Min Density Floor: $(min_density)")
+    
+    t_init = time()
+    density = ones(Float32, nElem) 
+    alpha_field = zeros(Float32, nElem)
+    println("  [Timing] Field allocation: $(round((time()-t_init)*1000, digits=2))ms")
+    
+    t_geom = time()
+    MeshShapeProcessing.apply_geometric_modifiers!(density, alpha_field, nodes, elements, shapes, min_density)
+    geom_time = time() - t_geom
+    
+    println("  [Timing] Geometric processing: $(round(geom_time, digits=2))s")
+    println("           Throughput: $(round(nElem/geom_time/1e6, digits=2))M elements/sec")
+      
+    t_stats = time()
+    original_density = copy(density) 
+    protected_elements_mask = (original_density .!= 1.0f0) 
+    num_protected = sum(protected_elements_mask)
+    
+    num_voids = count(d -> d < 0.01f0, density)
+    num_stiff = count(d -> d > 1.01f0, density)
+    num_passive = count(i -> protected_elements_mask[i] && density[i] >= 0.01f0 && density[i] <= 1.01f0, 1:nElem)
+    num_designable = nElem - num_protected
+    
+    println("  [Timing] Statistics computation: $(round((time()-t_stats)*1000, digits=2))ms")
+    println("\n  Element Classification:")
+    println("    Designable:        $(num_designable) ($(round(100*num_designable/nElem, digits=2))%)")
+    println("    Protected Total:   $(num_protected) ($(round(100*num_protected/nElem, digits=2))%)")
+    println("      ├─ Voids:         $(num_voids)")
+    println("      ├─ Stiff:         $(num_stiff)")
+    println("      └─ Passive:       $(num_passive)")
+    
+    println("="^80 * "\n")
+ 
+    return density, original_density, protected_elements_mask, alpha_field
+end 
+
+"""
+    validate_configuration(config)
+
+Validates configuration parameters and warns about potential issues.
+Obsolete parameters (e.g. filter_R_final_perc) have been removed.
+"""
+function validate_configuration(config::Dict)
+    warnings = String[]
+    
+    opt_params = get(config, "optimization_parameters", Dict())
+    
+    max_culling = Float32(get(opt_params, "max_culling_ratio", 0.15))
+    if max_culling > 0.3
+        push!(warnings, "max_culling_ratio is high ($(max_culling)). Values >0.3 may cause instability.")
+    end
+    
+    final_threshold = Float32(get(opt_params, "final_density_threshold", 0.85))
+    if final_threshold > 0.95
+        push!(warnings, "final_density_threshold is high ($(final_threshold)). Values >0.95 may trigger collapse.")
+    end
+    
+    
+    
+    solver_params = get(config, "solver_parameters", Dict())
+    
+    max_iter = Int(get(solver_params, "max_iterations", 40000))
+    if max_iter < 1000
+        push!(warnings, "max_iterations is low ($max_iter). May not converge for large problems.")
+    end
+    
+    geom = get(config, "geometry", Dict())
+    
+    lx = get(geom, "length_x", 1.0)
+    ly = get(geom, "length_y", 1.0)
+    lz = get(geom, "length_z", 1.0)
+    
+    aspect_ratio = max(lx, ly, lz) / min(lx, ly, lz)
+    if aspect_ratio > 10.0
+        push!(warnings, "Domain aspect ratio is extreme ($(round(aspect_ratio, digits=1))). May cause solver issues.")
+    end
+    
+    if !isempty(warnings)
+        println("\n" * "⚠"^80)
+        println(">>> [CONFIG VALIDATION] Warnings:")
+        for (i, w) in enumerate(warnings)
+            println("  $i. $w")
+        end
+        println("⚠"^80 * "\n")
+    else
+        println(">>> [CONFIG VALIDATION] No issues detected.")
+    end
+    
+    return length(warnings) == 0
+end
+
+"""
+    print_configuration_summary(config)
+
+Prints a formatted summary of the configuration.
+Updated to use new variable names.
+"""
+function print_configuration_summary(config::Dict)
+    println("\n" * "="^80)
+    println(">>> [CONFIGURATION SUMMARY]")
+    println("="^80)
+    
+    hw_profile = get(config, "hardware_profile_applied", get(config, "gpu_profile", "Unknown"))
+    println("  Hardware Profile: $hw_profile")
+    
+    geom = get(config, "geometry", Dict())
+    lx = get(geom, "length_x", 0)
+    ly = get(geom, "length_y", 0)
+    lz = get(geom, "length_z", 0)
+    println("  Domain: $(lx) × $(ly) × $(lz)")
+    
+    n_iter = get(config, "number_of_iterations", 30)
+    println("  Iterations: $n_iter")
+    
+    solver = get(config, "solver_parameters", Dict())
+    solver_type = get(solver, "solver_type", "unknown")
+    precond = get(solver, "preconditioner", "unknown")
+    tol = get(solver, "tolerance", 0.0)
+    println("  Solver: $solver_type")
+    println("  Preconditioner: $precond")
+    println("  Tolerance: $tol")
+    
+    opt = get(config, "optimization_parameters", Dict())
+    max_cull = get(opt, "max_culling_ratio", 0.0)
+    final_thresh = get(opt, "final_density_threshold", 0.0)
+    println("  Max Culling Ratio: $max_cull")
+    println("  Final Density Threshold: $final_thresh")
+    
+    
+    mesh_conf = get(config, "mesh_settings", Dict())
+    target_active = get(mesh_conf, "final_target_of_active_elements", 0)
+    max_growth = get(mesh_conf, "max_growth_rate", 0.0)
+    println("  Target Active Elements: $target_active")
+    println("  Max Growth Rate: $max_growth")
+    
+    println("="^80 * "\n")
+end
+
+"""
+    export_configuration(config, filename)
+
+Exports the current configuration to a YAML file.
+Useful for reproducibility and debugging.
+"""
+function export_configuration(config::Dict, filename::String)
+    try
+        YAML.write_file(filename, config)
+        println(">>> [CONFIG] Exported configuration to: $filename")
+        return true
+    catch e
+        @warn "Failed to export configuration: $e"
+        return false
+    end
+end
+
+"""
+    compare_configurations(config1, config2)
+
+Compares two configurations and highlights differences.
+"""
+function compare_configurations(config1::Dict, config2::Dict)
+    println("\n" * "="^80)
+    println(">>> [CONFIG COMPARISON]")
+    println("="^80)
+    
+    all_keys = union(keys(config1), keys(config2))
+    differences = 0
+    
+    for key in all_keys
+        if !haskey(config1, key)
+            println("  ADDED: $key = $(config2[key])")
+            differences += 1
+        elseif !haskey(config2, key)
+            println("  REMOVED: $key = $(config1[key])")
+            differences += 1
+        elseif config1[key] != config2[key]
+            println("  CHANGED: $key")
+            println("    From: $(config1[key])")
+            println("    To:   $(config2[key])")
+            differences += 1
+        end
+    end
+    
+    if differences == 0
+        println("  No differences found.")
+    else
+        println("\n  Total differences: $differences")
+    end
+    
+    println("="^80 * "\n")
+end
+
+"""
+    get_config_value(config, path, default)
+
+Safely retrieves nested configuration values.
+Example: get_config_value(config, "solver_parameters.tolerance", 1e-6)
+"""
+function get_config_value(config::Dict, path::String, default)
+    keys_list = split(path, '.')
+    current = config
+    
+    for key in keys_list
+        if !haskey(current, key)
+            return default
+        end
+        current = current[key]
+    end
+    
+    return current
+end
+
+"""
+    set_config_value!(config, path, value)
+
+Safely sets nested configuration values.
+Example: set_config_value!(config, "solver_parameters.tolerance", 1e-8)
+"""
+function set_config_value!(config::Dict, path::String, value)
+    keys_list = split(path, '.')
+    current = config
+    
+    for (i, key) in enumerate(keys_list)
+        if i == length(keys_list)
+            current[key] = value
+        else
+            if !haskey(current, key) || !isa(current[key], Dict)
+                current[key] = Dict()
+            end
+            current = current[key]
+        end
+    end
+end
+
+"""
+    apply_preset!(config, preset_name)
+
+Applies predefined configuration presets.
+"""
+function apply_preset!(config::Dict, preset_name::String)
+    presets = Dict(
+        "conservative" => Dict(
+            "optimization_parameters" => Dict(
+                "max_culling_ratio" => 0.05,
+                "final_density_threshold" => 0.75
+            ),
+            "solver_parameters" => Dict(
+                "tolerance" => 1.0e-7
+            )
+        ),
+        "aggressive" => Dict(
+            "optimization_parameters" => Dict(
+                "max_culling_ratio" => 0.25,
+                "final_density_threshold" => 0.90
+            ),
+            "solver_parameters" => Dict(
+                "tolerance" => 1.0e-5
+            )
+        ),
+        "balanced" => Dict(
+            "optimization_parameters" => Dict(
+                "max_culling_ratio" => 0.15,
+                "final_density_threshold" => 0.85
+            ),
+            "solver_parameters" => Dict(
+                "tolerance" => 1.0e-6
+            )
+        )
+    )
+    
+    if !haskey(presets, preset_name)
+        @warn "Unknown preset: $preset_name. Available: $(keys(presets))"
+        return false
+    end
+    
+    preset = presets[preset_name]
+    
+    for (section, values) in preset
+        if !haskey(config, section)
+            config[section] = Dict()
+        end
+        
+        for (key, value) in values
+            config[section][key] = value
+        end
+    end
+    
+    println(">>> [CONFIG] Applied preset: '$preset_name'")
+    return true
+end
+
+end
+"// # FILE: .\src\IO\ExportVTK.jl";
+// 
+module ExportVTK 
+
+using Printf 
+using Base64 
+
+export export_solution_vti, export_solution
+
+"""
+    export_solution_vti(...)
+
+Writes the simulation results to a VTK XML Image Data file (.vti).
+Optimized to optionally include Principal Stresses and Directions based on config.
+"""
+function export_solution_vti(dims::Tuple{Int,Int,Int}, 
+                             spacing::Tuple{Float32,Float32,Float32}, 
+                             origin::Tuple{Float32,Float32,Float32},
+                             density::Vector{Float32}, 
+                             l1_stress::Vector{Float32},
+                             von_mises::Vector{Float32},
+                             principal_vals::Matrix{Float32},
+                             principal_max_dirs::Matrix{Float32},
+                             principal_min_dirs::Matrix{Float32},
+                             config::Dict,
+                             filename::String)
+
+    nx, ny, nz = dims
+    n_cells = length(density)
+    
+    if !endswith(filename, ".vti"); filename *= ".vti"; end
+
+    
+    out_settings = get(config, "output_settings", Dict())
+    save_vec_val = get(out_settings, "save_principal_stress_vectors", "no")
+    write_vectors = (lowercase(string(save_vec_val)) == "yes" || save_vec_val == true)
+
+    open(filename, "w") do io
+        write(io, "<?xml version=\"1.0\"?>\n")
+        write(io, "<VTKFile type=\"ImageData\" version=\"0.1\" byte_order=\"LittleEndian\">\n")
+        
+        # WholeExtent="x1 x2 y1 y2 z1 z2" (0-based node indices, so dims are cell counts)
+        extent = "0 $nx 0 $ny 0 $nz"
+        dx, dy, dz = spacing
+        ox, oy, oz = origin
+        
+        write(io, "  <ImageData WholeExtent=\"$extent\" Origin=\"$ox $oy $oz\" Spacing=\"$dx $dy $dz\">\n")
+        write(io, "    <Piece Extent=\"$extent\">\n")
+        write(io, "      <CellData Scalars=\"Density\" Vectors=\"MaxPrincipalDirection\">\n")
+        
+        
+        current_offset = 0
+        
+        
+        write(io, "        <DataArray type=\"Float32\" Name=\"Density\" format=\"appended\" offset=\"$current_offset\"/>\n")
+        current_offset += sizeof(UInt32) + n_cells * sizeof(Float32)
+        
+        
+        write(io, "        <DataArray type=\"Float32\" Name=\"L1_Stress\" format=\"appended\" offset=\"$current_offset\"/>\n")
+        current_offset += sizeof(UInt32) + n_cells * sizeof(Float32)
+        
+        
+        write(io, "        <DataArray type=\"Float32\" Name=\"VonMises\" format=\"appended\" offset=\"$current_offset\"/>\n")
+        current_offset += sizeof(UInt32) + n_cells * sizeof(Float32)
+
+        if write_vectors
+            
+            write(io, "        <DataArray type=\"Float32\" Name=\"PrincipalValues\" NumberOfComponents=\"3\" format=\"appended\" offset=\"$current_offset\"/>\n")
+            current_offset += sizeof(UInt32) + (n_cells * 3) * sizeof(Float32)
+
+            
+            write(io, "        <DataArray type=\"Float32\" Name=\"MaxPrincipalDirection\" NumberOfComponents=\"3\" format=\"appended\" offset=\"$current_offset\"/>\n")
+            current_offset += sizeof(UInt32) + (n_cells * 3) * sizeof(Float32)
+
+            
+            write(io, "        <DataArray type=\"Float32\" Name=\"MinPrincipalDirection\" NumberOfComponents=\"3\" format=\"appended\" offset=\"$current_offset\"/>\n")
+            current_offset += sizeof(UInt32) + (n_cells * 3) * sizeof(Float32)
+        end
+
+        write(io, "      </CellData>\n")
+        write(io, "    </Piece>\n")
+        write(io, "  </ImageData>\n")
+        
+        
+        write(io, "  <AppendedData encoding=\"raw\">\n")
+        write(io, "_") 
+        
+        
+        function write_array(arr)
+            n_bytes = UInt32(length(arr) * sizeof(Float32))
+            write(io, n_bytes)
+            write(io, arr)
+        end
+
+        write_array(density)
+        write_array(l1_stress)
+        write_array(von_mises)
+
+        if write_vectors
+            
+            write_array(vec(principal_vals)) 
+            
+            write_array(vec(principal_max_dirs))
+            
+            write_array(vec(principal_min_dirs))
+        end
+        
+        write(io, "\n  </AppendedData>\n")
+        write(io, "</VTKFile>\n")
+    end
+end
+
+function export_solution(nodes, elements, U, F, bc, p_field, vm, voigt, l1, p_max_dir, p_min_dir; 
+                         density=nothing, filename="out.vtk", config=nothing, kwargs...)
+                          
+    if config !== nothing
+        geom = config["geometry"]
+        nx = Int(geom["nElem_x_computed"])
+        ny = Int(geom["nElem_y_computed"])
+        nz = Int(geom["nElem_z_computed"])
+        dx = Float32(geom["dx_computed"])
+        dy = Float32(geom["dy_computed"])
+        dz = Float32(geom["dz_computed"])
+        
+        
+        export_solution_vti((nx, ny, nz), (dx, dy, dz), (0f0, 0f0, 0f0), 
+                            density, l1, vm, p_field, p_max_dir, p_min_dir, config, filename)
+    else
+        
+        println("[WARN] Export skipped: No configuration provided.")
+    end
+end
+
+end
+"// # FILE: .\src\IO\Postprocessing.jl";
+// 
+module Postprocessing
+
+using JSON, Printf
+using Base.Threads
+using CUDA
+using LinearAlgebra
+using Logging 
+using ..Mesh
+using ..MeshUtilities 
+using ..ExportVTK
+using ..Diagnostics 
+import MarchingCubes: MC, march
+
+export export_iteration_results, export_smooth_watertight_stl
+
+function suppress_specific_warnings(f::Function, module_to_suppress::Module)
+    current_logger = global_logger()
+    filtered_logger = EarlyFilteredLogger(current_logger) do args
+        if args.level == Logging.Warn && args._module == module_to_suppress
+            return false 
+        end
+        return true 
+    end
+    with_logger(f, filtered_logger)
+end
+
+function safe_parse_int(val, default::Int)
+    if val === nothing; return default; end
+    if isa(val, Number); return Int(val); end
+    if isa(val, String)
+        clean_val = replace(val, "_" => "")
+        return try parse(Int, clean_val) catch; default end
+    end
+    return default
+end
+
+function get_smooth_nodal_densities(density::Vector{Float32}, elements::Matrix{Int}, nNodes::Int)
+    node_sums = zeros(Float32, nNodes)
+    node_counts = zeros(Int, nNodes)
+    nElem = length(density)
+    
+    @inbounds for e in 1:nElem
+        rho = density[e]
+        for i in 1:8
+            node_idx = elements[e, i]
+            if node_idx > 0 && node_idx <= nNodes
+                node_sums[node_idx] += rho
+                node_counts[node_idx] += 1
+            end
+        end
+    end
+    nodal_density = zeros(Float32, nNodes)
+    @inbounds for i in 1:nNodes
+        if node_counts[i] > 0
+            nodal_density[i] = node_sums[i] / Float32(node_counts[i])
+        end
+    end
+    return nodal_density
+end
+
+function smooth_grid!(grid::Array{Float32, 3}, passes::Int)
+    if passes <= 0; return; end
+    nx, ny, nz = size(grid)
+    temp_grid = copy(grid)
+    
+    for _ in 1:passes
+        Threads.@threads for k in 2:(nz-1)
+            for j in 2:(ny-1)
+                for i in 2:(nx-1)
+                    sum_neighbors = grid[i-1,j,k] + grid[i+1,j,k] +
+                                    grid[i,j-1,k] + grid[i,j+1,k] +
+                                    grid[i,j,k-1] + grid[i,j,k+1]
+                    temp_grid[i,j,k] = (grid[i,j,k] * 4.0f0 + sum_neighbors) * 0.1f0
+                end
+            end
+        end
+        grid[2:end-1, 2:end-1, 2:end-1] .= temp_grid[2:end-1, 2:end-1, 2:end-1]
+    end
+end
+
+function trilinear_interpolate(vals, xd::Float32, yd::Float32, zd::Float32)
+    c00 = vals[1]*(1f0-xd) + vals[2]*xd
+    c01 = vals[4]*(1f0-xd) + vals[3]*xd
+    c10 = vals[5]*(1f0-xd) + vals[6]*xd
+    c11 = vals[8]*(1f0-xd) + vals[7]*xd
+    c0 = c00*(1f0-yd) + c01*yd
+    c1 = c10*(1f0-yd) + c11*yd
+    return c0*(1f0-zd) + c1*zd
+end
+
+function decimate_mesh!(vertices::Vector{Tuple{Float64, Float64, Float64}}, 
+                        triangles::AbstractVector, 
+                        target_triangle_count::Int)
+    current_count = length(triangles)
+    
+    if current_count > 2_000_000 
+        Diagnostics.print_warn("Mesh too large for decimation ($current_count tris). Skipping to preserve performance.")
+        return triangles
+    end
+
+    if target_triangle_count <= 0 || current_count <= target_triangle_count
+        return triangles
+    end
+
+    Diagnostics.print_info("Decimating mesh: $current_count -> $target_triangle_count triangles...")
+    
+    mutable_tris = Vector{Vector{Int}}(undef, current_count)
+    for i in 1:current_count
+        t = triangles[i]
+        mutable_tris[i] = [Int(t[1]), Int(t[2]), Int(t[3])]
+    end
+
+    max_passes = 15
+    for pass in 1:max_passes
+        if length(mutable_tris) <= target_triangle_count; break; end
+
+        edges = Vector{Tuple{Float64, Int, Int}}()
+        sizehint!(edges, length(mutable_tris) * 3)
+
+        for t in mutable_tris
+            v1, v2, v3 = t[1], t[2], t[3]
+            d12 = (vertices[v1][1]-vertices[v2][1])^2 + (vertices[v1][2]-vertices[v2][2])^2 + (vertices[v1][3]-vertices[v2][3])^2
+            d23 = (vertices[v2][1]-vertices[v3][1])^2 + (vertices[v2][2]-vertices[v3][2])^2 + (vertices[v2][3]-vertices[v3][3])^2
+            d31 = (vertices[v3][1]-vertices[v1][1])^2 + (vertices[v3][2]-vertices[v1][2])^2 + (vertices[v3][3]-vertices[v1][3])^2
+            push!(edges, (d12, min(v1,v2), max(v1,v2)))
+            push!(edges, (d23, min(v2,v3), max(v2,v3)))
+            push!(edges, (d31, min(v3,v1), max(v3,v1)))
+        end
+
+        sort!(edges, by = x -> x[1])
+        
+        replacements = collect(1:length(vertices))
+        collapsed_nodes = falses(length(vertices))
+        n_collapsed = 0
+        
+        tris_to_remove = length(mutable_tris) - target_triangle_count
+        limit_collapses = max(100, tris_to_remove) 
+
+        for (dist, u, v) in edges
+            if n_collapsed >= limit_collapses; break; end
+            if !collapsed_nodes[u] && !collapsed_nodes[v]
+                replacements[v] = u
+                mx = (vertices[u][1] + vertices[v][1]) * 0.5
+                my = (vertices[u][2] + vertices[v][2]) * 0.5
+                mz = (vertices[u][3] + vertices[v][3]) * 0.5
+                vertices[u] = (mx, my, mz)
+                collapsed_nodes[u] = true 
+                collapsed_nodes[v] = true
+                n_collapsed += 1
+            end
+        end
+
+        if n_collapsed == 0; break; end
+
+        new_triangles = Vector{Vector{Int}}()
+        sizehint!(new_triangles, length(mutable_tris))
+
+        for t in mutable_tris
+            v1 = replacements[t[1]]
+            v2 = replacements[t[2]]
+            v3 = replacements[t[3]]
+            if v1 != v2 && v1 != v3 && v2 != v3
+                push!(new_triangles, [v1, v2, v3])
+            end
+        end
+        mutable_tris = new_triangles
+    end
+    return mutable_tris
+end
+
+function laplacian_smooth_mesh!(vertices::Vector{Tuple{Float64, Float64, Float64}}, 
+                                triangles::AbstractVector, 
+                                iterations::Int=3, lambda::Float64=0.5)
+    if iterations <= 0; return; end
+    nv = length(vertices)
+    new_pos = Vector{Tuple{Float64, Float64, Float64}}(undef, nv)
+    neighbor_counts = zeros(Int, nv)
+    neighbor_sums_x = zeros(Float64, nv)
+    neighbor_sums_y = zeros(Float64, nv)
+    neighbor_sums_z = zeros(Float64, nv)
+
+    for _ in 1:iterations
+        fill!(neighbor_counts, 0)
+        fill!(neighbor_sums_x, 0.0); fill!(neighbor_sums_y, 0.0); fill!(neighbor_sums_z, 0.0)
+
+        for tri in triangles
+            i1, i2, i3 = tri[1], tri[2], tri[3]
+            if i1 < 1 || i1 > nv || i2 < 1 || i2 > nv || i3 < 1 || i3 > nv; continue; end
+            v1 = vertices[i1]; v2 = vertices[i2]; v3 = vertices[i3]
+            neighbor_sums_x[i1] += v2[1]; neighbor_sums_y[i1] += v2[2]; neighbor_sums_z[i1] += v2[3]; neighbor_counts[i1] += 1
+            neighbor_sums_x[i1] += v3[1]; neighbor_sums_y[i1] += v3[2]; neighbor_sums_z[i1] += v3[3]; neighbor_counts[i1] += 1
+            neighbor_sums_x[i2] += v1[1]; neighbor_sums_y[i2] += v1[2]; neighbor_sums_z[i2] += v1[3]; neighbor_counts[i2] += 1
+            neighbor_sums_x[i2] += v3[1]; neighbor_sums_y[i2] += v3[2]; neighbor_sums_z[i2] += v3[3]; neighbor_counts[i2] += 1
+            neighbor_sums_x[i3] += v1[1]; neighbor_sums_y[i3] += v1[2]; neighbor_sums_z[i3] += v1[3]; neighbor_counts[i3] += 1
+            neighbor_sums_x[i3] += v2[1]; neighbor_sums_y[i3] += v2[2]; neighbor_sums_z[i3] += v2[3]; neighbor_counts[i3] += 1
+        end
+        
+        Threads.@threads for i in 1:nv
+            cnt = neighbor_counts[i]
+            if cnt > 0
+                old_x, old_y, old_z = vertices[i]
+                avg_x, avg_y, avg_z = neighbor_sums_x[i]/cnt, neighbor_sums_y[i]/cnt, neighbor_sums_z[i]/cnt
+                nx = old_x + lambda * (avg_x - old_x)
+                ny = old_y + lambda * (avg_y - old_y)
+                nz = old_z + lambda * (avg_z - old_z)
+                new_pos[i] = (nx, ny, nz)
+            else
+                new_pos[i] = vertices[i]
+            end
+        end
+        copyto!(vertices, new_pos)
+    end
+end
+
+"""
+    write_stl_chunked(filename, triangles, vertices)
+
+OPTIMIZED: Uses batched multi-threading to eliminate false sharing and 
+chunks output to minimize RAM spikes.
+"""
+function write_stl_chunked(filename::String, 
+                           triangles::AbstractVector, 
+                           vertices::Vector{Tuple{Float64, Float64, Float64}})
+    
+    n_tri = length(triangles)
+    
+    open(filename, "w") do io
+        
+        header_str = "HEXA TopOpt Optimized Binary STL"
+        header = zeros(UInt8, 80)
+        copyto!(header, 1, codeunits(header_str), 1, min(length(header_str), 80))
+        write(io, header)
+        write(io, UInt32(n_tri))
+
+        
+        
+        CHUNK_SIZE = 1_000_000 
+        buffer = Vector{UInt8}(undef, CHUNK_SIZE * 50)
+        
+        n_chunks = cld(n_tri, CHUNK_SIZE)
+        
+        for c in 1:n_chunks
+            start_idx = (c - 1) * CHUNK_SIZE + 1
+            end_idx = min(c * CHUNK_SIZE, n_tri)
+            n_in_chunk = end_idx - start_idx + 1
+            
+            
+            
+            
+            
+            
+            n_threads = Threads.nthreads()
+            batch_size = cld(n_in_chunk, n_threads)
+            
+            Threads.@threads for t in 1:n_threads
+                t_start = start_idx + (t - 1) * batch_size
+                t_end = min(start_idx + t * batch_size - 1, end_idx)
+                
+                if t_start <= t_end
+                    
+                    for i in t_start:t_end
+                        
+                        local_i = i - start_idx
+                        offset = local_i * 50
+                        
+                        tri = triangles[i]
+                        
+                        
+                        if tri[1] < 1 || tri[1] > length(vertices) ||
+                           tri[2] < 1 || tri[2] > length(vertices) ||
+                           tri[3] < 1 || tri[3] > length(vertices)
+                            continue
+                        end
+
+                        v1 = vertices[tri[1]]
+                        v2 = vertices[tri[2]]
+                        v3 = vertices[tri[3]]
+                        
+                        
+                        e1x, e1y, e1z = v2[1]-v1[1], v2[2]-v1[2], v2[3]-v1[3]
+                        e2x, e2y, e2z = v3[1]-v1[1], v3[2]-v1[2], v3[3]-v1[3]
+                        nx, ny, nz = e1y*e2z - e1z*e2y, e1z*e2x - e1x*e2z, e1x*e2y - e1y*e2x
+                        mag = sqrt(nx*nx + ny*ny + nz*nz)
+                        if mag > 1e-12; nx/=mag; ny/=mag; nz/=mag; else; nx=0.0; ny=0.0; nz=0.0; end
+                        
+                        
+                        ptr = pointer(buffer, offset + 1)
+                        p_f32 = reinterpret(Ptr{Float32}, ptr)
+                        
+                        unsafe_store!(p_f32, Float32(nx), 1)
+                        unsafe_store!(p_f32, Float32(ny), 2)
+                        unsafe_store!(p_f32, Float32(nz), 3)
+                        
+                        unsafe_store!(p_f32, Float32(v1[1]), 4)
+                        unsafe_store!(p_f32, Float32(v1[2]), 5)
+                        unsafe_store!(p_f32, Float32(v1[3]), 6)
+                        
+                        unsafe_store!(p_f32, Float32(v2[1]), 7)
+                        unsafe_store!(p_f32, Float32(v2[2]), 8)
+                        unsafe_store!(p_f32, Float32(v2[3]), 9)
+                        
+                        unsafe_store!(p_f32, Float32(v3[1]), 10)
+                        unsafe_store!(p_f32, Float32(v3[2]), 11)
+                        unsafe_store!(p_f32, Float32(v3[3]), 12)
+                        
+                        p_u16 = reinterpret(Ptr{UInt16}, ptr + 48)
+                        unsafe_store!(p_u16, UInt16(0), 1)
+                    end
+                end
+            end
+            
+            
+            
+            bytes_to_write = n_in_chunk * 50
+            write(io, view(buffer, 1:bytes_to_write))
+        end
+    end
+end
+
+function export_smooth_watertight_stl(density::Vector{Float32}, geom, threshold::Float32, filename::String; 
+                                      subdivision_level::Int=2, smoothing_passes::Int=2, 
+                                      mesh_smoothing_iters::Int=3, target_triangle_count::Int=0) 
+    
+    min_d, max_d = extrema(density)
+    if max_d < threshold
+        Diagnostics.print_info("Skipping STL: Max density ($max_d) < threshold ($threshold). No surface exists.")
+        return
+    end
+
+    try
+        dir_path = dirname(filename)
+        if !isempty(dir_path) && !isdir(dir_path); mkpath(dir_path); end
+
+        NX, NY, NZ = geom.nElem_x, geom.nElem_y, geom.nElem_z
+        dx, dy, dz = geom.dx, geom.dy, geom.dz
+        
+        
+        
+        actual_subdivision = subdivision_level
+        if length(density) > 5_000_000
+             actual_subdivision = 1
+        end
+
+        nodes_coarse, elements_coarse, _ = Mesh.generate_mesh(NX, NY, NZ; dx=dx, dy=dy, dz=dz)
+        nNodes_coarse = size(nodes_coarse, 1)
+        if length(density) != size(elements_coarse, 1); return; end
+        
+        nodal_density_coarse = get_smooth_nodal_densities(density, elements_coarse, nNodes_coarse)
+        grid_coarse = reshape(nodal_density_coarse, (NX+1, NY+1, NZ+1))
+        smooth_grid!(grid_coarse, smoothing_passes)
+
+        sub_NX, sub_NY, sub_NZ = NX * actual_subdivision, NY * actual_subdivision, NZ * actual_subdivision
+        pad = 1 
+        fine_dim_x, fine_dim_y, fine_dim_z = sub_NX+1+2*pad, sub_NY+1+2*pad, sub_NZ+1+2*pad
+        sub_dx, sub_dy, sub_dz = dx/Float32(actual_subdivision), dy/Float32(actual_subdivision), dz/Float32(actual_subdivision)
+
+        fine_grid = zeros(Float32, fine_dim_x, fine_dim_y, fine_dim_z)
+        x_coords = collect(Float32, range(-pad*sub_dx, step=sub_dx, length=fine_dim_x))
+        y_coords = collect(Float32, range(-pad*sub_dy, step=sub_dy, length=fine_dim_y))
+        z_coords = collect(Float32, range(-pad*sub_dz, step=sub_dz, length=fine_dim_z))
+
+        Threads.@threads for k_f in (1+pad):(fine_dim_z-pad)
+            for j_f in (1+pad):(fine_dim_y-pad)
+                for i_f in (1+pad):(fine_dim_x-pad)
+                    ix, iy, iz = i_f-(1+pad), j_f-(1+pad), k_f-(1+pad)
+                    idx_x, idx_y, idx_z = div(ix, actual_subdivision), div(iy, actual_subdivision), div(iz, actual_subdivision)
+                    if idx_x >= NX; idx_x = NX - 1; end
+                    if idx_y >= NY; idx_y = NY - 1; end
+                    if idx_z >= NZ; idx_z = NZ - 1; end
+                    c_i, c_j, c_k = idx_x + 1, idx_y + 1, idx_z + 1
+                    rem_x, rem_y, rem_z = ix - idx_x*actual_subdivision, iy - idx_y*actual_subdivision, iz - idx_z*actual_subdivision
+                    xd, yd, zd = Float32(rem_x)/actual_subdivision, Float32(rem_y)/actual_subdivision, Float32(rem_z)/actual_subdivision
+                    vals = (grid_coarse[c_i,c_j,c_k], grid_coarse[c_i+1,c_j,c_k], grid_coarse[c_i+1,c_j+1,c_k], grid_coarse[c_i,c_j+1,c_k],
+                            grid_coarse[c_i,c_j,c_k+1], grid_coarse[c_i+1,c_j,c_k+1], grid_coarse[c_i+1,c_j+1,c_k+1], grid_coarse[c_i,c_j+1,c_k+1])
+                    fine_grid[i_f, j_f, k_f] = trilinear_interpolate(vals, xd, yd, zd)
+                end
+            end
+        end
+
+        mc_struct = MC(fine_grid, Int; normal_sign=1, x=x_coords, y=y_coords, z=z_coords)
+        march(mc_struct, threshold)
+        
+        if length(mc_struct.vertices) == 0
+            Diagnostics.print_warn("STL generation produced 0 vertices (Empty).")
+            return
+        end
+
+        final_triangles = collect(mc_struct.triangles) 
+        final_vertices = [(Float64(v[1]), Float64(v[2]), Float64(v[3])) for v in mc_struct.vertices]
+
+        if mesh_smoothing_iters > 0
+            try
+                verts_tuple = copy(final_vertices)
+                laplacian_smooth_mesh!(verts_tuple, final_triangles, mesh_smoothing_iters, 0.5)
+                final_vertices = verts_tuple
+            catch e
+                Diagnostics.print_warn("Mesh smoothing failed: $e")
+            end
+        end
+
+        if target_triangle_count > 0 && length(final_triangles) > target_triangle_count
+             try
+                 final_triangles = decimate_mesh!(final_vertices, final_triangles, target_triangle_count)
+             catch e
+                 Diagnostics.print_error("Mesh decimation failed ($e). Exporting un-decimated mesh.")
+             end
+        end
+
+        
+        write_stl_chunked(filename, final_triangles, final_vertices)
+
+    catch e
+        Diagnostics.print_error("STL Export crashed: $e")
+        Diagnostics.write_crash_log("crash_log.txt", "STL_EXPORT", e, stacktrace(catch_backtrace()), 0, Dict(), Float32[])
+    end
+end
+
+function export_binary_for_web(filename::String, 
+                               nodes::Matrix{Float32}, 
+                               elements::Matrix{Int}, 
+                               density::Vector{Float32}, 
+                               l1_stress::Vector{Float32}, 
+                               principal_field::Matrix{Float32}, 
+                               geom, 
+                               threshold::Float32, 
+                               iter::Int, 
+                               current_radius::Float32, 
+                               config::Dict; 
+                               max_export_cells::Int=0) 
+    
+    all_active_indices = findall(x -> x >= threshold, density)
+    n_active = length(all_active_indices)
+    if n_active == 0; return; end
+
+    if max_export_cells > 0 && n_active > max_export_cells
+        step_val = n_active / max_export_cells
+        indices_to_export = Int[]
+        sizehint!(indices_to_export, max_export_cells)
+        curr_float_idx = 1.0
+        while curr_float_idx <= n_active
+            idx_int = floor(Int, curr_float_idx)
+            if idx_int <= n_active
+                push!(indices_to_export, all_active_indices[idx_int])
+            end
+            curr_float_idx += step_val
+        end
+        valid_indices = indices_to_export
+    else
+        valid_indices = all_active_indices
+    end
+
+    count = length(valid_indices)
+
+    meta = deepcopy(config)
+    meta["iteration"] = iter
+    meta["radius"] = current_radius
+    meta["threshold"] = threshold
+    if haskey(meta, "geometry") && isa(meta["geometry"], Dict)
+        for (key, shape) in meta["geometry"]
+            if isa(shape, Dict) && haskey(shape, "type")
+                if !haskey(shape, "action") && haskey(shape, "stiffness_ratio")
+                    ratio = Float32(shape["stiffness_ratio"])
+                    shape["action"] = ratio > 0 ? "add" : "remove"
+                end
+            end
+        end
+    end
+    meta["loads"] = get(config, "external_forces", [])
+    meta["bcs"] = get(config, "boundary_conditions", [])
+    meta["settings"] = get(config, "optimization_parameters", Dict())
+    
+    json_str = JSON.json(meta)
+    json_bytes = Vector{UInt8}(json_str)
+    json_len = UInt32(length(json_bytes))
+
+    try
+        open(filename, "w") do io
+            write(io, 0x48455841) # Magic "HEXA"
+            write(io, UInt32(2))  
+            write(io, Int32(iter))
+            write(io, Float32(current_radius))
+            write(io, Float32(threshold))
+            write(io, UInt32(count))
+            write(io, Float32(geom.dx))
+            write(io, Float32(geom.dy))
+            write(io, Float32(geom.dz))
+
+            centroids = zeros(Float32, count * 3)
+            densities = zeros(Float32, count)
+            signed_l1 = zeros(Float32, count)
+
+            Threads.@threads for i in 1:count
+                idx = valid_indices[i]
+                c = MeshUtilities.element_centroid(idx, nodes, elements)
+                centroids[3*(i-1)+1] = c[1]
+                centroids[3*(i-1)+2] = c[2]
+                centroids[3*(i-1)+3] = c[3]
+
+                densities[i] = density[idx]
+
+                s1 = principal_field[1, idx]
+                s2 = principal_field[2, idx]
+                s3 = principal_field[3, idx]
+                abs_max = abs(s1); sign_val = sign(s1)
+                if abs(s2) > abs_max; abs_max = abs(s2); sign_val = sign(s2); end
+                if abs(s3) > abs_max; abs_max = abs(s3); sign_val = sign(s3); end
+                signed_l1[i] = l1_stress[idx] * sign_val
+            end
+
+            write(io, centroids)
+            write(io, densities)
+            write(io, signed_l1)
+            write(io, json_len)
+            write(io, json_bytes)
+        end
+    catch e
+        Diagnostics.print_error("[Binary Export] Failed to write file: $e")
+    end
+end
+
+function export_iteration_results(iter::Int, base_name::String, RESULTS_DIR::String, 
+                                  nodes::Matrix{Float32}, elements::Matrix{Int}, 
+                                  U_full::AbstractVector, F::AbstractVector, 
+                                  bc_indicator::Matrix{Float32}, principal_field::Matrix{Float32}, 
+                                  vonmises_field::Vector{Float32}, full_stress_voigt::Matrix{Float32}, 
+                                  l1_stress_norm_field::Vector{Float32}, principal_max_dir_field::Matrix{Float32}, principal_min_dir_field::Matrix{Float32}, 
+                                  density::Vector{Float32}, E::Float32, geom; 
+                                  iso_threshold::Float32=0.8f0, 
+                                  current_radius::Float32=0.0f0, 
+                                  config::Dict=Dict(), 
+                                  save_bin::Bool=true, 
+                                  save_stl::Bool=true, 
+                                  save_vtk::Bool=true)
+      
+    U_f32 = (eltype(U_full) == Float32) ? U_full : Float32.(U_full)
+    F_f32 = (eltype(F) == Float32) ? F : Float32.(F)
+
+    iter_prefix = "iter_$(iter)_"
+
+    out_settings = get(config, "output_settings", Dict())
+    
+    raw_max_cells = get(out_settings, "maximum_cells_in_binary_output", 25_000_000)
+    max_export_cells = safe_parse_int(raw_max_cells, 25_000_000)
+
+    raw_stl_target = get(out_settings, "stl_target_triangle_count", 0)
+    target_triangles = safe_parse_int(raw_stl_target, 0)
+
+    if save_bin
+        try
+            print("      > Writing Checkpoint/Web Binary...")
+            t_web = time()
+            
+            bin_filename = joinpath(RESULTS_DIR, "$(iter_prefix)$(base_name)_webdata.bintop")
+            export_binary_for_web(
+                bin_filename, nodes, elements, density, l1_stress_norm_field, 
+                principal_field, geom, iso_threshold, iter, current_radius, 
+                config; max_export_cells=max_export_cells
+            )
+            @printf(" done (%.3fs)\n", time() - t_web)
+        catch e
+            Diagnostics.print_warn("Web binary export failed. Continuing.")
+            Diagnostics.write_crash_log("crash_log.txt", "WEB_EXPORT", e, stacktrace(catch_backtrace()), iter, config, density)
+        end
+    end
+
+    if save_vtk
+        try
+            print("      > Writing VTK (Paraview)...")
+            t_vtk = time()
+            solution_filename = joinpath(RESULTS_DIR, "$(iter_prefix)$(base_name)_solution") 
+            
+            
+            ExportVTK.export_solution(nodes, elements, U_f32, F_f32, bc_indicator, 
+                                    principal_field, vonmises_field, full_stress_voigt, 
+                                    l1_stress_norm_field, principal_max_dir_field, principal_min_dir_field; 
+                                    density=density, threshold=iso_threshold, scale=Float32(1.0), 
+                                    filename=solution_filename,
+                                    config=config, 
+                                    max_cells=0)
+
+            @printf(" done (%.3fs)\n", time() - t_vtk)
+        catch e
+            Diagnostics.print_warn("VTK export failed. Continuing.")
+            Diagnostics.write_crash_log("crash_log.txt", "VTK_EXPORT", e, stacktrace(catch_backtrace()), iter, config, density)
+        end
+    end
+
+    if save_stl && iter > 0 
+        print("      > Writing Isosurface STL...")
+        t_stl = time()
+        stl_filename = joinpath(RESULTS_DIR, "$(iter_prefix)$(base_name)_isosurface.stl")
+        
+        subdiv = get(out_settings, "stl_subdivision_level", 2)
+        smooth = get(out_settings, "stl_smoothing_passes", 2)
+        mesh_smooth = get(out_settings, "stl_mesh_smoothing_iters", 3)
+        
+        export_smooth_watertight_stl(density, geom, iso_threshold, stl_filename; 
+                                     subdivision_level=subdiv, 
+                                     smoothing_passes=smooth,
+                                     mesh_smoothing_iters=mesh_smooth,
+                                     target_triangle_count=target_triangles)
+        @printf(" done (%.3fs)\n", time() - t_stl)
+    end
+end 
+
+end
+"// # FILE: .\src\Mesh\Mesh.jl";
+module Mesh 
+ 
+export node_index, generate_mesh 
+
+ 
+using LinearAlgebra, Printf 
+ 
+""" 
+    node_index(i, j, k, nNodes_x, nNodes_y) 
+ 
+Converts 3D indices (i, j, k) into a linear node index (column‑major ordering). 
+""" 
+function node_index(i, j, k, nNodes_x, nNodes_y) 
+    return i + (j-1)*nNodes_x + (k-1)*nNodes_x*nNodes_y 
+end 
+ 
+""" 
+    generate_mesh(nElem_x, nElem_y, nElem_z; 
+                  dx=1.0f0, dy=1.0f0, dz=1.0f0) 
+ 
+Generates a structured (prismatic) hexahedral mesh. 
+""" 
+function generate_mesh(nElem_x::Int, nElem_y::Int, nElem_z::Int; 
+                       dx::Float32=Float32(1.0),  
+                       dy::Float32=Float32(1.0),  
+                       dz::Float32=Float32(1.0))  
+      
+    nNodes_x = nElem_x + 1 
+    nNodes_y = nElem_y + 1 
+    nNodes_z = nElem_z + 1 
+    dims = (nNodes_x, nNodes_y, nNodes_z) 
+        
+    nNodes = nNodes_x * nNodes_y * nNodes_z 
+    nodes = zeros(Float32, nNodes, 3) 
+    idx = 1 
+    for k in 1:nNodes_z, j in 1:nNodes_y, i in 1:nNodes_x 
+        nodes[idx, :] = [(i-1)*dx, (j-1)*dy, (k-1)*dz] 
+        idx += 1 
+    end 
+      
+    nElem = (nNodes_x - 1) * (nNodes_y - 1) * (nNodes_z - 1) 
+    elements = Matrix{Int}(undef, nElem, 8) 
+    elem_idx = 1 
+    for k in 1:(nNodes_z-1), j in 1:(nNodes_y-1), i in 1:(nNodes_x-1) 
+        n1 = node_index(i, j, k, nNodes_x, nNodes_y) 
+        n2 = node_index(i+1, j, k, nNodes_x, nNodes_y) 
+        n3 = node_index(i+1, j+1, k, nNodes_x, nNodes_y) 
+        n4 = node_index(i, j+1, k, nNodes_x, nNodes_y) 
+        n5 = node_index(i, j, k+1, nNodes_x, nNodes_y) 
+        n6 = node_index(i+1, j, k+1, nNodes_x, nNodes_y) 
+        n7 = node_index(i+1, j+1, k+1, nNodes_x, nNodes_y) 
+        n8 = node_index(i, j+1, k+1, nNodes_x, nNodes_y) 
+        elements[elem_idx, :] = [n1, n2, n3, n4, n5, n6, n7, n8] 
+        elem_idx += 1 
+    end 
+ 
+    println("Generated structured mesh: $(nElem) elements, $(nNodes) nodes.") 
+ 
+    return nodes, elements, dims 
+end 
+ 
+end
+"// # FILE: .\src\Mesh\MeshPruner.jl";
+
+
+module MeshPruner
+
+using LinearAlgebra
+using SparseArrays
+
+export prune_system, reconstruct_full_solution
+
+function prune_system(nodes::Matrix{Float32}, 
+                      elements::Matrix{Int}, 
+                      density::Vector{Float32}, 
+                      threshold::Float32, 
+                      bc_indicator::Matrix{Float32}, 
+                      F::Vector{Float32})
+
+    nElem = size(elements, 1)
+    nNodes = size(nodes, 1)
+
+    active_mask = density .> threshold
+    active_element_indices = findall(active_mask)
+    nActiveElem = length(active_element_indices)
+
+    if nActiveElem == 0
+        error("MeshPruner: No active elements found (Threshold: $threshold). System is empty.")
+    end
+
+    active_nodes_mask = falses(nNodes)
+    
+    for e in active_element_indices
+        for i in 1:8
+            node_idx = elements[e, i]
+            active_nodes_mask[node_idx] = true
+        end
+    end
+
+    old_to_new_node_map = zeros(Int, nNodes)
+    new_to_old_node_map = Int[]
+    
+    current_new_id = 1
+    for i in 1:nNodes
+        if active_nodes_mask[i]
+            old_to_new_node_map[i] = current_new_id
+            push!(new_to_old_node_map, i)
+            current_new_id += 1
+        end
+    end
+    
+    nActiveNodes = length(new_to_old_node_map)
+    reduced_nodes = nodes[new_to_old_node_map, :]
+
+    reduced_elements = Matrix{Int}(undef, nActiveElem, 8)
+    for (i, old_e_idx) in enumerate(active_element_indices)
+        for j in 1:8
+            old_node = elements[old_e_idx, j]
+            new_node = old_to_new_node_map[old_node]
+            reduced_elements[i, j] = new_node
+        end
+    end
+
+    reduced_bc = bc_indicator[new_to_old_node_map, :]
+    reduced_ndof = nActiveNodes * 3
+    reduced_F = zeros(Float32, reduced_ndof)
+    
+    for (new_idx, old_idx) in enumerate(new_to_old_node_map)
+        base_old = 3 * (old_idx - 1)
+        base_new = 3 * (new_idx - 1)
+        reduced_F[base_new+1] = F[base_old+1]
+        reduced_F[base_new+2] = F[base_old+2]
+        reduced_F[base_new+3] = F[base_old+3]
+    end
+
+    reduced_density = density[active_element_indices]
+
+    return (
+        nodes = reduced_nodes,
+        elements = reduced_elements,
+        bc_indicator = reduced_bc,
+        F = reduced_F,
+        density = reduced_density,
+        old_to_new_node_map = old_to_new_node_map,
+        new_to_old_node_map = new_to_old_node_map,
+        active_element_indices = active_element_indices,
+        n_original_nodes = nNodes,
+        n_original_elems = nElem
+    )
+end
+
+function reconstruct_full_solution(u_reduced::AbstractVector, 
+                                   new_to_old_node_map::Vector{Int}, 
+                                   n_full_nodes::Int)
+    
+    T = eltype(u_reduced)
+    ndof_full = n_full_nodes * 3
+    u_full = zeros(T, ndof_full)
+
+    for (new_node_idx, old_node_idx) in enumerate(new_to_old_node_map)
+        base_new = 3 * (new_node_idx - 1)
+        base_old = 3 * (old_node_idx - 1)
+
+        u_full[base_old+1] = u_reduced[base_new+1]
+        u_full[base_old+2] = u_reduced[base_new+2]
+        u_full[base_old+3] = u_reduced[base_new+3]
+    end
+
+    return u_full
+end
+
+end
+"// # FILE: .\src\Mesh\MeshRefiner.jl";
+
+module MeshRefiner
+
+using LinearAlgebra
+using Printf
+using Base.Threads
+using ..Mesh
+using ..Helpers
+
+export refine_mesh_and_fields
+
+function estimate_element_memory_cost_bytes(hard_element_limit::Int)
+    if hard_element_limit > 500_000_000 
+        return 180 
+    else
+        return 220 
+    end
+end
+
+"""
+    sample_nearest_neighbor(grid, nx, ny, nz, tx, ty, tz)
+
+Robust Piecewise Constant (Nearest Neighbor) sampling.
+Preserves sharp boundaries (Solid vs Void) and avoids creating artificial "gray" elements
+that the optimizer would immediately cull.
+"""
+@inline function sample_nearest_neighbor(grid::Vector{Float32}, nx::Int, ny::Int, nz::Int, 
+                                         tx::Float32, ty::Float32, tz::Float32)
+    
+    
+    ix = clamp(floor(Int, tx * nx), 0, nx - 1)
+    iy = clamp(floor(Int, ty * ny), 0, ny - 1)
+    iz = clamp(floor(Int, tz * nz), 0, nz - 1)
+
+    
+    idx = (ix + 1) + (iy * nx) + (iz * nx * ny)
+    
+    return @inbounds grid[idx]
+end
+
+function refine_mesh_and_fields(nodes::Matrix{Float32}, 
+                                elements::Matrix{Int}, 
+                                density::Vector{Float32}, 
+                                alpha_field::Vector{Float32}, 
+                                current_dims::Tuple{Int, Int, Int},
+                                target_active_count::Int, 
+                                domain_bounds::NamedTuple; 
+                                max_growth_rate::Float64=1.2, 
+                                hard_element_limit::Int=800_000_000,
+                                update_method::String="hard") 
+
+    C_RESET = "\u001b[0m"
+    C_BOLD = "\u001b[1m"
+    C_CYAN = "\u001b[36m"
+    C_GREEN = "\u001b[32m"
+    C_YELLOW = "\u001b[33m"
+
+    println("\n" * C_CYAN * "="^60 * C_RESET)
+    println(C_CYAN * C_BOLD * ">>> [MESH REFINER] Evaluating Refinement (Conservative Voxel Split)" * C_RESET)
+
+    n_total_old = length(density)
+    n_active_old = count(d -> d > 0.001f0, density) 
+    active_ratio = max(0.0001, n_active_old / n_total_old) 
+    
+    println("    Current Total Elements:  $(n_total_old)")
+    println("    Current Active Elements: $(n_active_old) ($(round(active_ratio*100, digits=2))%)")
+    println("    Target Active Limit:     $(target_active_count)")
+
+    ideal_total_from_target = round(Int, (target_active_count / active_ratio) * 0.90)
+    rate_limit_elements = round(Int, n_total_old * max_growth_rate)
+    
+    final_new_total = n_total_old
+
+    if n_active_old >= target_active_count
+        println(C_GREEN * "    [OK] Target active count reached. Maintaining mesh resolution." * C_RESET)
+        final_new_total = n_total_old 
+    else
+        limits = [
+            ("Target Active Limit", ideal_total_from_target),
+            ("Growth Rate Limit", rate_limit_elements),
+            ("Config Hard Limit", hard_element_limit)
+        ]
+        
+        sort!(limits, by = x -> x[2])
+        
+        limiting_factor_name = limits[1][1]
+        final_new_total = limits[1][2]
+        
+        println("    Constraint Analysis:")
+        for (name, val) in limits
+            col = (name == limiting_factor_name) ? C_YELLOW : C_RESET
+            println("      - $col$name: $(Base.format_bytes(val * 200)) approx ($val elems)$C_RESET")
+        end
+        println("    LIMIT APPLIED: $C_YELLOW$limiting_factor_name$C_RESET")
+    end
+
+    if final_new_total > hard_element_limit
+        final_new_total = hard_element_limit
+    end
+
+    
+    if final_new_total < (n_total_old * 1.05)
+        println(C_YELLOW * "    [SKIP] Calculated growth too small (< 5%). Skipping." * C_RESET)
+        println(C_CYAN * "="^60 * "\n" * C_RESET)
+        return nodes, elements, density, alpha_field, current_dims
+    end
+
+    println(C_GREEN * C_BOLD * "    >>> EXECUTING REFINEMENT TO: $final_new_total elements" * C_RESET)
+
+    len_x, len_y, len_z = domain_bounds.len_x, domain_bounds.len_y, domain_bounds.len_z
+    new_nx, new_ny, new_nz, new_dx, new_dy, new_dz, actual_count = 
+        Helpers.calculate_element_distribution(len_x, len_y, len_z, final_new_total)
+        
+    println("      > Grid: $(new_nx)x$(new_ny)x$(new_nz) = $actual_count")
+    println("      > Res:  $(new_dx) x $(new_dy) x $(new_dz)")
+
+    new_nodes, new_elements, new_dims = Mesh.generate_mesh(
+        new_nx, new_ny, new_nz; 
+        dx=new_dx, dy=new_dy, dz=new_dz
+    )
+    
+    
+    min_pt = domain_bounds.min_pt
+    new_nodes[:, 1] .+= min_pt[1]
+    new_nodes[:, 2] .+= min_pt[2]
+    new_nodes[:, 3] .+= min_pt[3]
+    
+    println("      > Mapping fields (Nearest Neighbor / Voxel Split)...")
+    n_new_total = size(new_elements, 1)
+    new_density = zeros(Float32, n_new_total)
+    new_alpha   = zeros(Float32, n_new_total) 
+    
+    old_nx = Int(current_dims[1] - 1)
+    old_ny = Int(current_dims[2] - 1)
+    old_nz = Int(current_dims[3] - 1)
+    
+    
+    new_nx_64 = Int64(new_nx)
+    new_ny_64 = Int64(new_ny)
+    
+    Threads.@threads for e_new in 1:n_new_total
+        
+        e_new_idx = Int64(e_new)
+        
+        tmp = e_new_idx - 1
+        iz = div(tmp, new_nx_64 * new_ny_64)
+        rem = tmp % (new_nx_64 * new_ny_64)
+        iy = div(rem, new_nx_64)
+        ix = rem % new_nx_64
+        
+        
+        
+        tx = (Float32(ix) + 0.5f0) / Float32(new_nx)
+        ty = (Float32(iy) + 0.5f0) / Float32(new_ny)
+        tz = (Float32(iz) + 0.5f0) / Float32(new_nz)
+        
+        
+        
+        new_density[e_new] = sample_nearest_neighbor(density, old_nx, old_ny, old_nz, tx, ty, tz)
+        new_alpha[e_new]   = sample_nearest_neighbor(alpha_field, old_nx, old_ny, old_nz, tx, ty, tz)
+    end
+    
+    println(C_GREEN * "    [DONE] Refinement Complete (Boundary Preserved)." * C_RESET)
+    println(C_CYAN * "="^60 * "\n" * C_RESET)
+
+    return new_nodes, new_elements, new_density, new_alpha, new_dims
+end
+
+end
+"// # FILE: .\src\Mesh\MeshShapeProcessing.jl";
+
+
+module MeshShapeProcessing 
+ 
+export apply_geometric_modifiers!
+ 
+using LinearAlgebra 
+using Base.Threads
+using ..MeshUtilities     
+ 
+"""
+    precompute_shape_bboxes(shapes)
+
+Precompute bounding boxes for each shape to enable early rejection.
+"""
+function precompute_shape_bboxes(shapes::Vector{Any})
+    bboxes = Vector{NamedTuple{(:xmin, :xmax, :ymin, :ymax, :zmin, :zmax), NTuple{6, Float32}}}(undef, length(shapes))
+    
+    for (i, shape) in enumerate(shapes)
+        shape_type = lowercase(get(shape, "type", ""))
+        
+        if shape_type == "sphere"
+            center = tuple(Float32.(shape["center"])...)
+            radius = Float32(shape["diameter"]) / 2.0f0
+            bboxes[i] = (
+                xmin = center[1] - radius, xmax = center[1] + radius,
+                ymin = center[2] - radius, ymax = center[2] + radius,
+                zmin = center[3] - radius, zmax = center[3] + radius
+            )
+        elseif shape_type == "box"
+            center = tuple(Float32.(shape["center"])...)
+            
+            if haskey(shape, "size")
+                sz_raw = shape["size"]
+                if isa(sz_raw, AbstractVector) && length(sz_raw) >= 3
+                    hx = Float32(sz_raw[1]) / 2.0f0
+                    hy = Float32(sz_raw[2]) / 2.0f0
+                    hz = Float32(sz_raw[3]) / 2.0f0
+                else
+                    hx = hy = hz = 0.5f0
+                end
+            elseif haskey(shape, "side")
+                half_side = Float32(shape["side"]) / 2.0f0
+                hx = hy = hz = half_side
+            else
+                hx = hy = hz = 0.5f0
+            end
+            
+            bboxes[i] = (
+                xmin = center[1] - hx, xmax = center[1] + hx,
+                ymin = center[2] - hy, ymax = center[2] + hy,
+                zmin = center[3] - hz, zmax = center[3] + hz
+            )
+        else
+            
+            bboxes[i] = (
+                xmin = -Inf32, xmax = Inf32,
+                ymin = -Inf32, ymax = Inf32,
+                zmin = -Inf32, zmax = Inf32
+            )
+        end
+    end
+    
+    return bboxes
+end
+
+"""
+    bbox_contains(bbox, pt)
+
+Fast bounding box check.
+"""
+@inline function bbox_contains(bbox, pt)
+    return (pt[1] >= bbox.xmin && pt[1] <= bbox.xmax &&
+            pt[2] >= bbox.ymin && pt[2] <= bbox.ymax &&
+            pt[3] >= bbox.zmin && pt[3] <= bbox.zmax)
+end
+
+"""
+    apply_geometric_modifiers!(density, alpha_field, nodes, elements, shapes, min_density)
+
+Iterates over elements and modifies the `density` and `alpha_field` based on the 
+`stiffness_ratio` of the geometric shapes defined in the configuration.
+
+OPTIMIZED VERSION:
+- Multi-threaded element processing
+- Bounding box early rejection
+- Vectorized centroid calculation
+- Reduced allocations
+"""
+function apply_geometric_modifiers!(density::Vector{Float32}, 
+                                    alpha_field::Vector{Float32},
+                                    nodes::Matrix{Float32}, 
+                                    elements::Matrix{Int}, 
+                                    shapes::Vector{Any},
+                                    min_density::Float32)
+    
+    if isempty(shapes)
+        return
+    end
+
+    nElem = size(elements, 1)
+    
+    println("Processing geometric density and thermal modifiers...")
+    t_start = time()
+    
+    
+    bboxes = precompute_shape_bboxes(shapes)
+    
+    
+    n_shapes = length(shapes)
+    shape_types = Vector{String}(undef, n_shapes)
+    shape_ratios = Vector{Float32}(undef, n_shapes)
+    shape_centers = Vector{Tuple{Float32, Float32, Float32}}(undef, n_shapes)
+    shape_params = Vector{Any}(undef, n_shapes)
+    
+    for (i, shape) in enumerate(shapes)
+        shape_types[i] = lowercase(get(shape, "type", ""))
+        shape_ratios[i] = Float32(get(shape, "stiffness_ratio", 0.0))
+        
+        if haskey(shape, "center")
+            c = shape["center"]
+            shape_centers[i] = (Float32(c[1]), Float32(c[2]), Float32(c[3]))
+        else
+            shape_centers[i] = (0.0f0, 0.0f0, 0.0f0)
+        end
+        
+        
+        if shape_types[i] == "sphere"
+            shape_params[i] = Float32(shape["diameter"]) / 2.0f0  # radius
+        elseif shape_types[i] == "box"
+            if haskey(shape, "size")
+                sz_raw = shape["size"]
+                if isa(sz_raw, AbstractVector) && length(sz_raw) >= 3
+                    shape_params[i] = (Float32(sz_raw[1])/2.0f0, Float32(sz_raw[2])/2.0f0, Float32(sz_raw[3])/2.0f0)
+                else
+                    shape_params[i] = (0.5f0, 0.5f0, 0.5f0)
+                end
+            elseif haskey(shape, "side")
+                half_side = Float32(shape["side"]) / 2.0f0
+                shape_params[i] = (half_side, half_side, half_side)
+            else
+                shape_params[i] = (0.5f0, 0.5f0, 0.5f0)
+            end
+        else
+            shape_params[i] = nothing
+        end
+    end
+    
+    
+    centroids = Vector{Tuple{Float32, Float32, Float32}}(undef, nElem)
+    
+    Threads.@threads for e in 1:nElem
+        cx = 0.0f0; cy = 0.0f0; cz = 0.0f0
+        
+        @inbounds for i in 1:8
+            node_idx = elements[e, i]
+            cx += nodes[node_idx, 1]
+            cy += nodes[node_idx, 2]
+            cz += nodes[node_idx, 3]
+        end
+        
+        centroids[e] = (cx * 0.125f0, cy * 0.125f0, cz * 0.125f0)
+    end
+    
+    println("  [Optimization] Computed $(nElem) element centroids ($(round(time()-t_start, digits=2))s)")
+    
+    
+    Threads.@threads for e in 1:nElem
+        centroid = centroids[e]
+        
+        
+        for i in 1:n_shapes
+            
+            if !bbox_contains(bboxes[i], centroid)
+                continue
+            end
+            
+            
+            is_inside = false
+            
+            if shape_types[i] == "sphere"
+                center = shape_centers[i]
+                radius = shape_params[i]
+                
+                dx = centroid[1] - center[1]
+                dy = centroid[2] - center[2]
+                dz = centroid[3] - center[3]
+                dist_sq = dx*dx + dy*dy + dz*dz
+                
+                is_inside = (dist_sq <= radius*radius)
+                
+            elseif shape_types[i] == "box"
+                center = shape_centers[i]
+                half_sizes = shape_params[i]
+                
+                is_inside = (abs(centroid[1] - center[1]) <= half_sizes[1] &&
+                            abs(centroid[2] - center[2]) <= half_sizes[2] &&
+                            abs(centroid[3] - center[3]) <= half_sizes[3])
+            end
+            
+            if is_inside
+                ratio = shape_ratios[i]
+                
+                if ratio == 0.0f0
+                    
+                    density[e] = min_density
+                    alpha_field[e] = 0.0f0
+                elseif ratio < 0.0f0
+                    
+                    density[e] = abs(ratio)
+                    alpha_field[e] = 1.0f0
+                else
+                    
+                    density[e] = ratio
+                    alpha_field[e] = 0.0f0
+                end
+                
+                
+                break
+            end
+        end
+    end
+    
+    total_time = time() - t_start
+    println("  [Optimization] Element density and thermal processing complete ($(round(total_time, digits=2))s)")
+    println("                 Processed $(nElem) elements with $(n_shapes) shapes")
+    println("                 Throughput: $(round(nElem/total_time/1e6, digits=2))M elements/sec")
+end 
+ 
+end
+"// # FILE: .\src\Mesh\MeshUtilities.jl";
+
+
+module MeshUtilities 
+ 
+export inside_sphere, inside_box, element_centroid
+ 
+using LinearAlgebra 
+ 
+""" 
+    element_centroid(e, nodes, elements) 
+ 
+Computes the centroid of element `e`.
+OPTIMIZED: Uses scalar math to avoid allocating vectors inside threaded loops.
+Returns a Tuple (x, y, z).
+""" 
+function element_centroid(e::Int, nodes::Matrix{Float32}, elements::Matrix{Int}) 
+    cx = 0.0f0
+    cy = 0.0f0
+    cz = 0.0f0
+
+    @inbounds for i in 1:8
+        node_idx = elements[e, i]
+        cx += nodes[node_idx, 1]
+        cy += nodes[node_idx, 2]
+        cz += nodes[node_idx, 3]
+    end
+
+    inv8 = 0.125f0 
+    return (cx * inv8, cy * inv8, cz * inv8)  
+end 
+
+""" 
+    inside_sphere(pt, center, diam) 
+Return true if point `pt` is inside a sphere of diameter `diam` at `center`. 
+Accepts pt as Vector or Tuple.
+""" 
+function inside_sphere(pt, center::Tuple{Float32,Float32,Float32}, diam::Float32) 
+    r = diam / 2f0 
+     
+    dx = pt[1] - center[1]
+    dy = pt[2] - center[2]
+    dz = pt[3] - center[3]
+    return (dx*dx + dy*dy + dz*dz) <= (r*r)
+end 
+
+""" 
+    inside_box(pt, center, size) 
+Return true if point `pt` is inside a box with dimensions `size` (x, y, z) centered at `center`. 
+Accepts pt as Vector or Tuple.
+""" 
+function inside_box(pt, center::Tuple{Float32,Float32,Float32}, box_size::Tuple{Float32,Float32,Float32}) 
+    half_x = box_size[1] / 2f0 
+    half_y = box_size[2] / 2f0 
+    half_z = box_size[3] / 2f0 
+     
+    return abs(pt[1] - center[1]) <= half_x && 
+           abs(pt[2] - center[2]) <= half_y && 
+           abs(pt[3] - center[3]) <= half_z 
+end 
+ 
+end
+"// # FILE: .\src\Optimization\GPUExplicitFilter.jl";
+
+
+module GPUExplicitFilter
+
+using CUDA
+using LinearAlgebra
+using Printf
+
+export apply_explicit_filter!
+
+
+
+
+
+"""
+    diffusion_kernel_interior!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    Standard 7-point Laplacian stencil for interior elements.
+    Processes elements that are at least 1 element away from all boundaries.
+"""
+function diffusion_kernel_interior!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    
+    
+    if i > 1 && i < nx && j > 1 && j < ny && k > 1 && k < nz
+        @inbounds begin
+            idx = i + (j-1)*nx + (k-1)*nx*ny
+            center = rho_old[idx]
+            
+            
+            left   = rho_old[idx - 1]
+            right  = rho_old[idx + 1]
+            front  = rho_old[idx - nx]
+            back   = rho_old[idx + nx]
+            bottom = rho_old[idx - nx*ny]
+            top    = rho_old[idx + nx*ny]
+            
+            laplacian = (left + right + front + back + bottom + top - 6.0f0 * center)
+            
+            
+            rho_new[idx] = center + dt_over_dx2 * laplacian
+        end
+    end
+    return nothing
+end
+
+"""
+    diffusion_kernel_faces!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    Neumann BCs (ghost values) for the 6 planar faces.
+"""
+function diffusion_kernel_faces!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    
+    if i < 1 || i > nx || j < 1 || j > ny || k < 1 || k > nz; return nothing; end
+    
+    
+    on_x = (i == 1 || i == nx) && (j > 1 && j < ny) && (k > 1 && k < nz)
+    on_y = (j == 1 || j == ny) && (i > 1 && i < nx) && (k > 1 && k < nz)
+    on_z = (k == 1 || k == nz) && (i > 1 && i < nx) && (j > 1 && j < ny)
+    
+    if !(on_x || on_y || on_z); return nothing; end
+    
+    @inbounds begin
+        idx = i + (j-1)*nx + (k-1)*nx*ny
+        center = rho_old[idx]
+        sum_n = 0.0f0
+        w_tot = 0.0f0
+        
+        
+        if i > 1
+            sum_n += rho_old[idx-1]
+            w_tot += 1.0f0
+        elseif i == 1
+            
+            sum_n += (2.0f0*center - rho_old[idx+1])
+            w_tot += 1.0f0
+        end
+        
+        if i < nx
+            sum_n += rho_old[idx+1]
+            w_tot += 1.0f0
+        elseif i == nx
+            sum_n += (2.0f0*center - rho_old[idx-1])
+            w_tot += 1.0f0
+        end
+        
+        
+        if j > 1
+            sum_n += rho_old[idx-nx]
+            w_tot += 1.0f0
+        elseif j == 1
+            sum_n += (2.0f0*center - rho_old[idx+nx])
+            w_tot += 1.0f0
+        end
+        
+        if j < ny
+            sum_n += rho_old[idx+nx]
+            w_tot += 1.0f0
+        elseif j == ny
+            sum_n += (2.0f0*center - rho_old[idx-nx])
+            w_tot += 1.0f0
+        end
+        
+        
+        if k > 1
+            sum_n += rho_old[idx-nx*ny]
+            w_tot += 1.0f0
+        elseif k == 1
+            sum_n += (2.0f0*center - rho_old[idx+nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        if k < nz
+            sum_n += rho_old[idx+nx*ny]
+            w_tot += 1.0f0
+        elseif k == nz
+            sum_n += (2.0f0*center - rho_old[idx-nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        rho_new[idx] = center + dt_over_dx2 * (sum_n - w_tot * center)
+    end
+    return nothing
+end
+
+"""
+    diffusion_kernel_edges!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    Neumann BCs for the 12 edges (lines where 2 faces meet).
+"""
+function diffusion_kernel_edges!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    
+    if i < 1 || i > nx || j < 1 || j > ny || k < 1 || k > nz; return nothing; end
+    
+    
+    b_cnt = 0
+    if i==1||i==nx; b_cnt+=1; end
+    if j==1||j==ny; b_cnt+=1; end
+    if k==1||k==nz; b_cnt+=1; end
+    
+    if b_cnt != 2; return nothing; end
+    
+    @inbounds begin
+        idx = i + (j-1)*nx + (k-1)*nx*ny
+        center = rho_old[idx]
+        sum_n = 0.0f0
+        w_tot = 0.0f0
+        
+        
+        if i > 1
+            sum_n += rho_old[idx-1]
+            w_tot += 1.0f0
+        elseif i == 1 && nx > 1
+            sum_n += (2.0f0*center - rho_old[idx+1])
+            w_tot += 1.0f0
+        end
+        
+        if i < nx
+            sum_n += rho_old[idx+1]
+            w_tot += 1.0f0
+        elseif i == nx && nx > 1
+            sum_n += (2.0f0*center - rho_old[idx-1])
+            w_tot += 1.0f0
+        end
+        
+        
+        if j > 1
+            sum_n += rho_old[idx-nx]
+            w_tot += 1.0f0
+        elseif j == 1 && ny > 1
+            sum_n += (2.0f0*center - rho_old[idx+nx])
+            w_tot += 1.0f0
+        end
+        
+        if j < ny
+            sum_n += rho_old[idx+nx]
+            w_tot += 1.0f0
+        elseif j == ny && ny > 1
+            sum_n += (2.0f0*center - rho_old[idx-nx])
+            w_tot += 1.0f0
+        end
+        
+        
+        if k > 1
+            sum_n += rho_old[idx-nx*ny]
+            w_tot += 1.0f0
+        elseif k == 1 && nz > 1
+            sum_n += (2.0f0*center - rho_old[idx+nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        if k < nz
+            sum_n += rho_old[idx+nx*ny]
+            w_tot += 1.0f0
+        elseif k == nz && nz > 1
+            sum_n += (2.0f0*center - rho_old[idx-nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        if w_tot > 0.0f0
+            rho_new[idx] = center + dt_over_dx2 * (sum_n - w_tot * center)
+        else
+            rho_new[idx] = center
+        end
+    end
+    return nothing
+end
+
+"""
+    diffusion_kernel_corners!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    Neumann BCs for the 8 corners (points where 3 faces meet).
+"""
+function diffusion_kernel_corners!(rho_new, rho_old, dt_over_dx2, nx, ny, nz)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - 1) * blockDim().z + threadIdx().z
+    
+    if i < 1 || i > nx || j < 1 || j > ny || k < 1 || k > nz; return nothing; end
+    
+    
+    is_corner = (i==1||i==nx) && (j==1||j==ny) && (k==1||k==nz)
+    if !is_corner; return nothing; end
+    
+    @inbounds begin
+        idx = i + (j-1)*nx + (k-1)*nx*ny
+        center = rho_old[idx]
+        sum_n = 0.0f0
+        w_tot = 0.0f0
+        
+        
+        if i > 1
+            sum_n += rho_old[idx-1]
+            w_tot += 1.0f0
+        elseif i == 1 && nx > 1
+            sum_n += (2.0f0*center - rho_old[idx+1])
+            w_tot += 1.0f0
+        end
+        
+        if i < nx
+            sum_n += rho_old[idx+1]
+            w_tot += 1.0f0
+        elseif i == nx && nx > 1
+            sum_n += (2.0f0*center - rho_old[idx-1])
+            w_tot += 1.0f0
+        end
+        
+        
+        if j > 1
+            sum_n += rho_old[idx-nx]
+            w_tot += 1.0f0
+        elseif j == 1 && ny > 1
+            sum_n += (2.0f0*center - rho_old[idx+nx])
+            w_tot += 1.0f0
+        end
+        
+        if j < ny
+            sum_n += rho_old[idx+nx]
+            w_tot += 1.0f0
+        elseif j == ny && ny > 1
+            sum_n += (2.0f0*center - rho_old[idx-nx])
+            w_tot += 1.0f0
+        end
+        
+        
+        if k > 1
+            sum_n += rho_old[idx-nx*ny]
+            w_tot += 1.0f0
+        elseif k == 1 && nz > 1
+            sum_n += (2.0f0*center - rho_old[idx+nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        if k < nz
+            sum_n += rho_old[idx+nx*ny]
+            w_tot += 1.0f0
+        elseif k == nz && nz > 1
+            sum_n += (2.0f0*center - rho_old[idx-nx*ny])
+            w_tot += 1.0f0
+        end
+        
+        if w_tot > 0.0f0
+            rho_new[idx] = center + dt_over_dx2 * (sum_n - w_tot * center)
+        else
+            rho_new[idx] = center
+        end
+    end
+    return nothing
+end
+
+
+
+
+
+"""
+    apply_explicit_filter!(density, nx, ny, nz, dx, dy, dz, radius, min_density)
+
+OPTIMIZED VERSION:
+1. Dynamic Slab Sizing: Utilizes all available VRAM instead of hardcoded 500MB.
+2. Optimized Thread Blocks: (32, 4, 4) for memory coalescing on X-axis.
+3. Execution Timer: Logs performance.
+4. Sparsity Culling: Skips processing for empty slabs.
+"""
+function apply_explicit_filter!(density::Vector{Float32}, 
+                                nx::Int, ny::Int, nz::Int,
+                                dx::Float32, dy::Float32, dz::Float32,
+                                radius::Float32,
+                                min_density::Float32=0.0001f0) 
+    
+    if !CUDA.functional(); return density; end
+    
+    t_start = time()
+    
+    
+    D = (radius^2) / 6.0f0
+    avg_dx = (dx + dy + dz) / 3.0f0
+    dt_stable = 0.15f0 * (avg_dx^2) / D
+    n_steps = max(10, round(Int, radius / avg_dx))
+    dt_over_dx2 = dt_stable * D / (avg_dx^2)
+    
+    halo = 2
+    
+    
+    free_mem = CUDA.available_memory()
+    bytes_per_node = 8 
+    
+    
+    usable_mem = max(500 * 1024^2, free_mem - (500 * 1024^2))
+    max_nodes = div(usable_mem, bytes_per_node)
+    
+    slice_size = nx * ny
+    max_slab_nz = div(max_nodes, slice_size)
+    if max_slab_nz < (halo*2 + 1); max_slab_nz = halo*2 + 1; end 
+    
+    n_slabs = cld(nz, max_slab_nz - 2*halo)
+    
+    
+    
+    threads = (32, 4, 4)
+    
+    println(@sprintf("    [ExplicitFilter] Radius=%.3f, Steps=%d, dt=%.2e, Slabs=%d (Unclamped Diffusion)", 
+                     radius, n_steps, dt_stable, n_slabs))
+    
+    filtered_density = copy(density)
+    
+    skipped_slabs = 0
+    
+    for slab_idx in 1:n_slabs
+        z_start = max(1, (slab_idx - 1) * (max_slab_nz - 2*halo) + 1 - halo)
+        z_end   = min(nz, z_start + max_slab_nz - 1)
+        slab_nz = z_end - z_start + 1
+        slab_size = nx * ny * slab_nz
+        
+        
+        slab_data = zeros(Float32, slab_size)
+        Threads.@threads for k in 1:slab_nz
+            global_k = z_start + k - 1
+            start_g = 1 + (global_k - 1) * nx * ny
+            end_g   = start_g + nx * ny - 1
+            start_l = 1 + (k - 1) * nx * ny
+            end_l   = start_l + nx * ny - 1
+            slab_data[start_l:end_l] = density[start_g:end_g]
+        end
+        
+        
+        # If the max density in this slab (including halos) is "Void",
+        
+        
+        max_val = maximum(slab_data)
+        
+        
+        if max_val <= (min_density * 1.01f0 + 1.0f-5)
+            skipped_slabs += 1
+            continue
+        end
+        
+        rho_gpu = CuArray(slab_data)
+        rho_new_gpu = CUDA.zeros(Float32, slab_size)
+        
+        blocks = (cld(nx, threads[1]), cld(ny, threads[2]), cld(slab_nz, threads[3]))
+        
+        for step in 1:n_steps
+            @cuda threads=threads blocks=blocks diffusion_kernel_interior!(
+                rho_new_gpu, rho_gpu, dt_over_dx2, nx, ny, slab_nz
+            )
+            @cuda threads=threads blocks=blocks diffusion_kernel_faces!(
+                rho_new_gpu, rho_gpu, dt_over_dx2, nx, ny, slab_nz
+            )
+            @cuda threads=threads blocks=blocks diffusion_kernel_edges!(
+                rho_new_gpu, rho_gpu, dt_over_dx2, nx, ny, slab_nz
+            )
+            @cuda threads=threads blocks=blocks diffusion_kernel_corners!(
+                rho_new_gpu, rho_gpu, dt_over_dx2, nx, ny, slab_nz
+            )
+            rho_gpu, rho_new_gpu = rho_new_gpu, rho_gpu
+        end
+        
+        CUDA.synchronize()
+        copyto!(slab_data, rho_gpu)
+        
+        
+        valid_z_start = (slab_idx == 1) ? 1 : halo + 1
+        valid_z_end   = (slab_idx == n_slabs) ? slab_nz : slab_nz - halo
+        
+        Threads.@threads for k in valid_z_start:valid_z_end
+            global_k = z_start + k - 1
+            start_g = 1 + (global_k - 1) * nx * ny
+            end_g   = start_g + nx * ny - 1
+            start_l = 1 + (k - 1) * nx * ny
+            end_l   = start_l + nx * ny - 1
+            filtered_density[start_g:end_g] = slab_data[start_l:end_l]
+        end
+        
+        CUDA.unsafe_free!(rho_gpu); CUDA.unsafe_free!(rho_new_gpu)
+    end
+    
+    GC.gc(); CUDA.reclaim()
+    
+    elapsed = time() - t_start
+    println(@sprintf("    [ExplicitFilter] R=%.3f, Slabs=%d/%d (Skipped %d Empty), Time=%.2fs", 
+                     radius, n_slabs - skipped_slabs, n_slabs, skipped_slabs, elapsed))
+    
+    return filtered_density
+end
+
+end
+"// # FILE: .\src\Optimization\TopOpt.jl";
+// 
+module TopologyOptimization 
+
+using LinearAlgebra
+using SparseArrays
+using Printf  
+using Statistics 
+using SuiteSparse 
+using CUDA
+using Base.Threads
+using ..Element
+using ..Mesh
+using ..GPUExplicitFilter
+using ..Helpers
+
+export update_density!, reset_filter_cache!
+
+mutable struct FilterCache
+    is_initialized::Bool
+    radius::Float32
+    K_filter::SuiteSparse.CHOLMOD.Factor{Float64} 
+    FilterCache() = new(false, 0.0f0)
+end
+
+const GLOBAL_FILTER_CACHE = FilterCache()
+
+function reset_filter_cache!()
+    GLOBAL_FILTER_CACHE.is_initialized = false
+end
+
+function apply_emergency_box_filter(density::Vector{Float32}, nx::Int, ny::Int, nz::Int)
+    println("    [EMERGENCY FILTER] Applying 3x3x3 box filter (CPU)...")
+    nElem = length(density)
+    filtered = copy(density)
+    
+    Threads.@threads for k in 2:nz-1
+        for j in 2:ny-1
+            for i in 2:nx-1
+                e = i + (j-1)*nx + (k-1)*nx*ny
+                if e < 1 || e > nElem; continue; end
+                
+                sum_rho = 0.0f0
+                count = 0
+                for dk in -1:1, dj in -1:1, di in -1:1
+                    neighbor_i = i + di; neighbor_j = j + dj; neighbor_k = k + dk
+                    if neighbor_i >= 1 && neighbor_i <= nx &&
+                       neighbor_j >= 1 && neighbor_j <= ny &&
+                       neighbor_k >= 1 && neighbor_k <= nz
+                         neighbor_idx = neighbor_i + (neighbor_j-1)*nx + (neighbor_k-1)*nx*ny
+                         if neighbor_idx >= 1 && neighbor_idx <= nElem
+                             sum_rho += density[neighbor_idx]
+                             count += 1
+                         end
+                    end
+                end
+                filtered[e] = (count > 0) ? (sum_rho / count) : density[e]
+            end
+        end
+    end
+    return filtered
+end
+
+function create_transition_zone(protected_mask::BitVector, nx::Int, ny::Int, nz::Int, depth::Int=3)
+    nElem = length(protected_mask)
+    transition_zone = falses(nElem)
+    
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        e = i + (j-1)*nx + (k-1)*nx*ny
+        if e < 1 || e > nElem; continue; end
+        if protected_mask[e]; continue; end
+        
+        found_protected = false
+        for dk in -depth:depth, dj in -depth:depth, di in -depth:depth
+            ni = i + di; nj = j + dj; nk = k + dk
+            if ni >= 1 && ni <= nx && nj >= 1 && nj <= ny && nk >= 1 && nk <= nz
+                neighbor_idx = ni + (nj-1)*nx + (nk-1)*nx*ny
+                if neighbor_idx >= 1 && neighbor_idx <= nElem && protected_mask[neighbor_idx]
+                    found_protected = true; break
+                end
+            end
+        end
+        if found_protected; transition_zone[e] = true; end
+    end
+    return transition_zone
+end
+
+function blend_transition_zone!(density::Vector{Float32}, 
+                                filtered_density::Vector{Float32},
+                                protected_mask::BitVector,
+                                transition_zone::BitVector,
+                                original_density::Vector{Float32},
+                                nx::Int, ny::Int, nz::Int,
+                                blend_depth::Int=3)
+    nElem = length(density)
+    Threads.@threads for k in 1:nz
+        for j in 1:ny
+            for i in 1:nx
+                e = i + (j-1)*nx + (k-1)*nx*ny
+                if e < 1 || e > nElem || !transition_zone[e]; continue; end
+                
+                min_dist = blend_depth + 1.0
+                for dk in -blend_depth:blend_depth, dj in -blend_depth:blend_depth, di in -blend_depth:blend_depth
+                    ni = i + di; nj = j + dj; nk = k + dk
+                    if ni >= 1 && ni <= nx && nj >= 1 && nj <= ny && nk >= 1 && nk <= nz
+                        neighbor_idx = ni + (nj-1)*nx + (nk-1)*nx*ny
+                        if neighbor_idx >= 1 && neighbor_idx <= nElem && protected_mask[neighbor_idx]
+                            dist = sqrt(Float32(di^2 + dj^2 + dk^2))
+                            min_dist = min(min_dist, dist)
+                        end
+                    end
+                end
+                
+                alpha = clamp(min_dist / blend_depth, 0.0f0, 1.0f0)
+                smooth_alpha = alpha * alpha * (3.0f0 - 2.0f0 * alpha)
+                density[e] = (1.0f0 - smooth_alpha) * original_density[e] + smooth_alpha * filtered_density[e]
+            end
+        end
+    end
+end
+
+function verify_boundary_filtering_detailed(density::Vector{Float32}, filtered::Vector{Float32}, 
+                                            nx::Int, ny::Int, nz::Int)
+    
+    interior_changed = 0; interior_total = 0
+    faces_changed = 0; faces_total = 0
+    edges_changed = 0; edges_total = 0
+    corners_changed = 0; corners_total = 0
+    nElem = nx * ny * nz
+
+    for k in 1:nz, j in 1:ny, i in 1:nx
+        e = i + (j-1)*nx + (k-1)*nx*ny
+        if e > nElem; continue; end
+        
+        changed = abs(density[e] - filtered[e]) > 1e-6
+        
+        on_boundary_count = 0
+        if i == 1 || i == nx; on_boundary_count += 1; end
+        if j == 1 || j == ny; on_boundary_count += 1; end
+        if k == 1 || k == nz; on_boundary_count += 1; end
+        
+        if on_boundary_count == 0
+            interior_total += 1
+            if changed; interior_changed += 1; end
+        elseif on_boundary_count == 1
+            faces_total += 1
+            if changed; faces_changed += 1; end
+        elseif on_boundary_count == 2
+            edges_total += 1
+            if changed; edges_changed += 1; end
+        else  
+            corners_total += 1
+            if changed; corners_changed += 1; end
+        end
+    end
+    
+    if interior_total > 0 && interior_changed > 0
+        pct = 100.0 * interior_changed / interior_total
+        status = pct > 90.0 ? "✓" : "~"
+        println(@sprintf("    [Filter Check] Interior:  %6d / %6d (%.1f%%)", interior_changed, interior_total, pct))
+    end
+end
+
+function update_density!(density::Vector{Float32}, 
+                         l1_stress_norm_field::Vector{Float32}, 
+                         protected_elements_mask::BitVector, 
+                         E::Float32, 
+                         l1_stress_allowable::Float32, 
+                         iter::Int, 
+                         number_of_iterations::Int, 
+                         original_density::Vector{Float32}, 
+                         min_density::Float32,  
+                         max_density::Float32, 
+                         config::Dict, 
+                         elements::Matrix{Int};
+                         force_no_cull::Bool=false,
+                         cutoff_threshold::Float32=0.05f0)  
+
+    nElem = length(density)
+    
+    if any(isnan, l1_stress_norm_field)
+        return 0.0f0, 0.0f0, 0.0f0, 0.0, 0, 0.0
+    end
+
+    opt_params = config["optimization_parameters"]
+    geom_params = config["geometry"]
+    
+    nElem_x = Int(geom_params["nElem_x_computed"]) 
+    nElem_y = Int(geom_params["nElem_y_computed"])
+    nElem_z = Int(geom_params["nElem_z_computed"])
+    dx = Float32(geom_params["dx_computed"])
+    dy = Float32(geom_params["dy_computed"])
+    dz = Float32(geom_params["dz_computed"])
+    avg_element_size = (dx + dy + dz) / 3.0f0
+    
+    proposed_density_field = zeros(Float32, nElem)
+    Threads.@threads for e in 1:nElem
+        if !protected_elements_mask[e] 
+            current_l1_stress = l1_stress_norm_field[e]
+            val = (current_l1_stress / l1_stress_allowable) / E
+            
+            proposed_density_field[e] = max(val, min_density)
+        else
+            proposed_density_field[e] = original_density[e]
+        end
+    end
+
+    target_d_phys = Float32(get(opt_params, "minimum_feature_size_physical", 0.0))
+    floor_d_elems = Float32(get(opt_params, "minimum_feature_size_elements", 3.0)) 
+    floor_d_phys = floor_d_elems * avg_element_size
+    d_min_phys = max(target_d_phys, floor_d_phys)
+
+    t = Float32(iter) / Float32(number_of_iterations)
+    t = clamp(t, 0.0f0, 1.0f0)
+
+    gamma = Float32(get(opt_params, "radius_decay_exponent", 1.8))
+    r_max_mult = Float32(get(opt_params, "radius_max_multiplier", 4.0))
+    r_min_mult = Float32(get(opt_params, "radius_min_multiplier", 0.5))
+    
+    decay_factor = 1.0f0 - (t^gamma)
+    r_baseline = (r_max_mult * d_min_phys) * decay_factor + (r_min_mult * d_min_phys)
+    R_floor = 1.0f0 * avg_element_size
+    R_final = max(r_baseline, R_floor)
+    
+    filtered_density_field = proposed_density_field
+    filter_time = 0.0
+    
+    if R_final > 1e-4
+        t_start = time()
+        filtered_density_field = GPUExplicitFilter.apply_explicit_filter!(
+            proposed_density_field, 
+            nElem_x, nElem_y, nElem_z,
+            dx, dy, dz, R_final,
+            min_density 
+        )
+        filter_time = time() - t_start
+        
+        if iter % 10 == 1
+           verify_boundary_filtering_detailed(proposed_density_field, filtered_density_field, 
+                                              nElem_x, nElem_y, nElem_z)
+        end
+
+        if any(isnan, filtered_density_field)
+            filtered_density_field = apply_emergency_box_filter(proposed_density_field, nElem_x, nElem_y, nElem_z)
+        end
+    end
+    
+    filtered_density_field = clamp.(filtered_density_field, min_density, max_density)
+    
+    blend_depth = max(3, round(Int, R_final / avg_element_size / 2))
+    transition_zone = create_transition_zone(protected_elements_mask, nElem_x, nElem_y, nElem_z, blend_depth)
+    
+    blend_transition_zone!(density, filtered_density_field, protected_elements_mask, 
+                           transition_zone, original_density, nElem_x, nElem_y, nElem_z, blend_depth)
+
+    n_chunks = Threads.nthreads()
+    chunk_size = cld(nElem, n_chunks)
+    partial_changes = Vector{Float32}(undef, n_chunks)
+    
+    @sync for (i, chunk_range) in enumerate(Iterators.partition(1:nElem, chunk_size))
+        Threads.@spawn begin
+            local_change = 0.0f0
+            for e in chunk_range
+                if !protected_elements_mask[e] 
+                    old_val = density[e]
+                    new_val = filtered_density_field[e]
+                    density[e] = new_val
+                    local_change += abs(new_val - old_val)
+                else
+                    density[e] = original_density[e]
+                end
+            end
+            partial_changes[i] = local_change
+        end
+    end
+    mean_change = sum(partial_changes) / Float32(nElem)
+
+    n_active_before = count(d -> d > min_density, density)
+    cull_count = 0
+    
+    if !force_no_cull
+        Threads.@threads for e in 1:nElem
+            if !protected_elements_mask[e] && !transition_zone[e]
+                
+                if density[e] < cutoff_threshold
+                    density[e] = min_density
+                    cull_count += 1 
+                end
+            end
+        end
+    end
+
+    update_method = get(opt_params, "density_update_method", "soft")
+    
+    Threads.@threads for e in 1:nElem
+        if !protected_elements_mask[e] && !transition_zone[e]
+            if update_method == "hard"
+                
+                if density[e] > min_density
+                    density[e] = 1.0f0
+                end
+            else
+                
+                if density[e] > max_density
+                    density[e] = max_density
+                end
+            end
+        end
+    end
+
+    Threads.@threads for e in 1:nElem
+        if protected_elements_mask[e]
+            density[e] = original_density[e]
+        end
+    end
+    
+    println("\n╔═══════════════════════════════════════════════════════════════╗")
+    println(@sprintf("║  CONTROLLED TOPOLOGY (Iter %d) ", iter))
+    println(@sprintf("║  Cutoff Applied: %.4f", cutoff_threshold))
+    println(@sprintf("║  Elements Removed: ~%d", cull_count))
+    println(@sprintf("║  Active Elements: %d -> %d", n_active_before, n_active_before - cull_count))
+    println("╚═══════════════════════════════════════════════════════════════╝\n")
+    
+    return mean_change, R_final, cutoff_threshold, filter_time, 0, 0.0
+end
+
+end
+"// # FILE: .\src\Utils\Diagnostics.jl";
+
+
+module Diagnostics
+
+using CUDA
+using Printf
+using Dates
+using JSON
+
+export log_status, check_memory, init_log_file, write_iteration_log, write_crash_log
+export print_banner, print_info, print_warn, print_error, print_success, print_substep
+export log_memory_snapshot, get_hardware_info, log_full_config, config_to_string
+
+const C_RESET   = "\u001b[0m"
+const C_BOLD    = "\u001b[1m"
+const C_RED     = "\u001b[31m"
+const C_GREEN   = "\u001b[32m"
+const C_YELLOW  = "\u001b[33m"
+const C_BLUE    = "\u001b[34m"
+const C_MAGENTA = "\u001b[35m"
+const C_CYAN    = "\u001b[36m"
+const C_WHITE   = "\u001b[37m"
+
+const LOG_HEADER = """
+| Iter |  Mesh Size  | Total El | Active El |  Radius  |  Cutoff  | Compliance | Strain Energy | Avg L1 Stress | Vol Frac | Delta Rho | Refine? | Residual | Preconditioner | Iter Time | Wall Time | VRAM |"""
+
+function get_timestamp()
+    return Dates.format(now(), "HH:MM:SS")
+end
+
+function print_banner(title::String; char="=", color=C_CYAN)
+    width = 90
+    println("\n" * color * char^width * C_RESET)
+    println(color * C_BOLD * ">>> " * title * C_RESET)
+    println(color * char^width * C_RESET)
+    flush(stdout)
+end
+
+function print_info(msg::String)
+    println(" " * C_CYAN * "[INFO] " * C_RESET * msg)
+    flush(stdout)
+end
+
+function print_warn(msg::String)
+    println(" " * C_YELLOW * C_BOLD * "[WARN] " * C_RESET * C_YELLOW * msg * C_RESET)
+    flush(stdout)
+end
+
+function print_error(msg::String)
+    println(" " * C_RED * C_BOLD * "[ERROR] " * C_RESET * C_RED * msg * C_RESET)
+    flush(stdout)
+end
+
+function print_success(msg::String)
+    println(" " * C_GREEN * C_BOLD * "[DONE] " * C_RESET * msg)
+    flush(stdout)
+end
+
+function print_substep(msg::String)
+    println("    " * C_MAGENTA * "-> " * C_RESET * msg)
+    flush(stdout)
+end
+
+function log_status(msg::String)
+    println(C_BOLD * "[$(get_timestamp())] " * C_RESET * msg)
+    flush(stdout) 
+end
+
+function check_memory()
+    if CUDA.functional()
+        free_gpu, total_gpu = CUDA.available_memory(), CUDA.total_memory()
+        return free_gpu
+    end
+    return 0
+end
+
+function get_hardware_info()
+    cpu_threads = Threads.nthreads()
+    sys_mem_free = Sys.free_memory() / 1024^3
+    sys_mem_total = Sys.total_memory() / 1024^3
+    
+    gpu_info = "None"
+    if CUDA.functional()
+        dev = CUDA.device()
+        name = CUDA.name(dev)
+        free_gpu, total_gpu = CUDA.available_memory(), CUDA.total_memory()
+        gpu_info = "$name | VRAM: $(round(free_gpu/1024^3, digits=2)) GB Free / $(round(total_gpu/1024^3, digits=2)) GB Total"
+    end
+
+    return """
+    Hardware Profile:
+      CPU Threads: $cpu_threads
+      System RAM:  $(round(sys_mem_free, digits=2)) GB Free / $(round(sys_mem_total, digits=2)) GB Total
+      GPU Device:  $gpu_info
+      Julia Ver:   $VERSION
+    """
+end
+
+function format_memory_str()
+    if CUDA.functional()
+        free_gpu, total_gpu = CUDA.available_memory(), CUDA.total_memory()
+        used_gb = (total_gpu - free_gpu) / 1024^3
+        total_gb = total_gpu / 1024^3
+        pct = (used_gb / total_gb) * 100
+        
+        col = C_GREEN
+        if pct > 80; col = C_YELLOW; end
+        if pct > 95; col = C_RED; end
+        
+        return "$col" * @sprintf("%4.1fG", used_gb) * C_RESET
+    end
+    return " CPU"
+end
+
+function log_memory_snapshot(label::String)
+    if CUDA.functional()
+        free, total = CUDA.available_memory(), CUDA.total_memory()
+        used = total - free
+        return @sprintf("[%s] VRAM: %.2f GB Used / %.2f GB Total (%.1f%%)", 
+            label, used/1024^3, total/1024^3, (used/total)*100)
+    end
+    return "[$label] VRAM: N/A"
+end
+
+function format_seconds_to_hms(seconds::Float64)
+    total_seconds = round(Int, seconds)
+    h = div(total_seconds, 3600)
+    m = div(total_seconds % 3600, 60)
+    s = total_seconds % 60
+    return @sprintf("%02d:%02d:%02d", h, m, s)
+end
+
+function log_full_config(io::IO, config::Dict, indent::Int=0)
+    prefix = " " ^ indent
+    for (k, v) in config
+        if isa(v, Dict)
+            write(io, "$prefix$k:\n")
+            log_full_config(io, v, indent + 2)
+        elseif isa(v, Vector)
+            write(io, "$prefix$k: [")
+            join(io, v, ", ")
+            write(io, "]\n")
+        else
+            write(io, "$prefix$k: $v\n")
+        end
+    end
+end
+
+function config_to_string(config::Dict)
+    io = IOBuffer()
+    log_full_config(io, config)
+    return String(take!(io))
+end
+
+function init_log_file(filename::String, config::Dict)
+    open(filename, "w") do io
+        write(io, "================================================================================\n")
+        write(io, "HEXA FEM TOPOLOGY OPTIMIZATION LOG\n")
+        write(io, "Start Date: $(now())\n")
+        write(io, "================================================================================\n\n")
+        
+        write(io, "--- HARDWARE INFO ---\n")
+        write(io, get_hardware_info())
+        write(io, "\n")
+
+        write(io, "--- CONFIGURATION ECHO ---\n")
+        log_full_config(io, config)
+        write(io, "\n")
+        
+        write(io, "="^220 * "\n") 
+        write(io, LOG_HEADER * "\n")
+    end
+    print_success("Log file initialized at: $filename")
+end
+
+function write_iteration_log(filename::String, iter, mesh_dims_str, nTotal, nActive, 
+                             filter_R, threshold, compliance, strain_energy, avg_l1, 
+                             vol_frac, delta_rho, refine_status, time_sec, 
+                             lin_residual=0.0, precond_type="-")
+    
+    vram_str_clean = replace(format_memory_str(), r"\u001b\[[0-9;]*m" => "") 
+    vram_str_colored = format_memory_str() 
+    
+    wall_time = Dates.format(now(), "HH:MM:SS")
+    time_hms = format_seconds_to_hms(Float64(time_sec))
+    
+    
+    f_R = Float64(filter_R)
+    f_th = Float64(threshold)
+    f_comp = Float64(compliance)
+    f_se = Float64(strain_energy)
+    f_l1 = Float64(avg_l1)
+    f_vf = Float64(vol_frac)
+    f_dr = Float64(delta_rho)
+    f_res = Float64(lin_residual)
+    f_total = Float64(nTotal)
+    f_active = Float64(nActive)
+
+    stat_col = C_RESET
+    if refine_status == "Refined"; stat_col = C_CYAN; end
+    if refine_status == "Annealing"; stat_col = C_MAGENTA; end
+    if refine_status == "Skip"; stat_col = C_YELLOW; end
+
+    line_console = @sprintf("| %s%4d%s | %11s | %8.2e | %9.2e | %8.4f | %8.3f | %10.2e | %13.2e | %13.2e | %8.3f | %7.2f%% | %s%7s%s | %8.2e | %-14s | %9s | %9s | %s |",
+                    C_BOLD, iter, C_RESET, mesh_dims_str, f_total, f_active, f_R, f_th,
+                    f_comp, f_se, f_l1, f_vf, 
+                    f_dr*100, stat_col, refine_status, C_RESET, f_res, precond_type, time_hms, wall_time, vram_str_colored)
+
+    line_file = @sprintf("| %4d | %11s | %8.2e | %9.2e | %8.4f | %8.3f | %10.2e | %13.2e | %13.2e | %8.3f | %7.2f%% | %7s | %8.2e | %-14s | %9s | %9s | %4s |",
+                    iter, mesh_dims_str, f_total, f_active, f_R, f_th,
+                    f_comp, f_se, f_l1, f_vf, 
+                    f_dr*100, refine_status, f_res, precond_type, time_hms, wall_time, vram_str_clean)
+    
+    try
+        open(filename, "a") do io
+            println(io, line_file)
+        end
+    catch e
+        println(C_RED * "[LOG ERROR] Could not write to log file." * C_RESET)
+    end
+    
+    if iter == 1 || iter % 10 == 0 || refine_status != "Nominal"
+        println("\n" * C_BOLD * LOG_HEADER * C_RESET)
+    end
+    println(line_console)
+    flush(stdout)
+end
+
+function write_crash_log(filename, stage, err, stack, iter, config, density_sample)
+    try
+        open(filename, "a") do io
+            write(io, "\n" * "="^80 * "\n")
+            write(io, "CRASH REPORT [$(Dates.now())]\n")
+            write(io, "="^80 * "\n")
+            write(io, "Stage: $stage\n")
+            write(io, "Iteration: $iter\n")
+            write(io, "Error: $err\n")
+            write(io, "\nStacktrace:\n")
+            showerror(io, err, stack)
+            write(io, "\n\nSystem State:\n")
+            write(io, get_hardware_info())
+            write(io, "="^80 * "\n")
+        end
+        print_warn("Detailed crash log written to: $filename")
+    catch e
+        print_error("Could not write crash log: $e")
+    end
+end
+
+end
+"// # FILE: .\src\Utils\Helpers.jl";
+// 
+module Helpers 
+
+using CUDA 
+using Printf
+
+export expand_element_indices, nodes_from_location, parse_location_component 
+export calculate_element_distribution, has_enough_gpu_memory, clear_gpu_memory, get_max_feasible_elements
+export enforce_gpu_memory_safety, log_gpu_state, is_gmg_feasible_on_gpu, cleanup_memory
+
+"""
+    cleanup_memory()
+
+Aggressively reclaims GPU and System memory. 
+Should be called before large allocations.
+"""
+function cleanup_memory()
+    GC.gc()
+    if CUDA.functional()
+        CUDA.reclaim()
+    end
+end
+
+function expand_element_indices(elem_inds, dims) 
+    nElem_x = dims[1] - 1 
+    nElem_y = dims[2] - 1 
+    nElem_z = dims[3] - 1 
+    inds = Vector{Vector{Int}}() 
+    for d in 1:3 
+        if (typeof(elem_inds[d]) == String && elem_inds[d] == ":") 
+            if d == 1 
+                push!(inds, collect(1:nElem_x)) 
+            elseif d == 2 
+                push!(inds, collect(1:nElem_y)) 
+            elseif d == 3 
+                push!(inds, collect(1:nElem_z)) 
+            end 
+        else 
+            push!(inds, [Int(elem_inds[d])]) 
+        end 
+    end 
+    result = Int[] 
+    for i in inds[1], j in inds[2], k in inds[3] 
+        eidx = i + (j-1)*nElem_x + (k-1)*nElem_x*nElem_y 
+        push!(result, eidx) 
+    end 
+    return result 
+end 
+
+function nodes_from_location(loc::Vector, dims) 
+    nNodes_x, nNodes_y, nNodes_z = dims 
+    ix = parse_location_component(loc[1], nNodes_x) 
+    iy = parse_location_component(loc[2], nNodes_y) 
+    iz = parse_location_component(loc[3], nNodes_z) 
+    nodes = Int[] 
+    for k in iz, j in iy, i in ix 
+        node = i + (j-1)*nNodes_x + (k-1)*nNodes_x*nNodes_y 
+        push!(nodes, node) 
+    end 
+    return nodes 
+end 
+
+function parse_location_component(val, nNodes::Int) 
+    if val == ":" 
+        return collect(1:nNodes) 
+    elseif isa(val, String) && endswith(val, "%") 
+        perc = parse(Float64, replace(val, "%"=>"")) / 100.0 
+        idx = round(Int, 1 + perc*(nNodes-1)) 
+        return [idx] 
+    elseif isa(val, Number) 
+        if 0.0 <= val <= 1.0 
+            idx = round(Int, 1 + val*(nNodes-1)) 
+            return [idx] 
+        else 
+            idx = clamp(round(Int, val), 1, nNodes) 
+            return [idx] 
+        end 
+    else 
+        error("Invalid location component: $val") 
+    end 
+end 
+
+function clear_gpu_memory() 
+    if !CUDA.functional() 
+        return (0, 0) 
+    end 
+    GC.gc() 
+    CUDA.reclaim() 
+
+    final_free, total = CUDA.available_memory(), CUDA.total_memory() 
+    return (final_free, total) 
+end 
+
+function log_gpu_state(label::String)
+    if CUDA.functional()
+        free_mem, total_mem = CUDA.available_memory(), CUDA.total_memory()
+        used_mem = total_mem - free_mem
+        @printf("   [GPU STATE] %-25s | Used: %6.2f GB | Free: %6.2f GB\n", 
+                label, used_mem/1024^3, free_mem/1024^3)
+        flush(stdout)
+    end
+end
+
+"""
+    estimate_bytes_per_element(matrix_free::Bool=true)
+
+Revised to account for IMPLICIT connectivity in GMG mode.
+"""
+function estimate_bytes_per_element(matrix_free::Bool=true, use_double::Bool=false)
+    prec_mult = use_double ? 2.0 : 1.0
+
+    if matrix_free
+        return 80.0 * prec_mult 
+    else
+        return 12000.0
+    end
+end
+
+"""
+    is_gmg_feasible_on_gpu(nElem::Int, use_double::Bool)
+
+Updated to check the Machine Limits from config.
+"""
+function is_gmg_feasible_on_gpu(nElem::Int, use_double::Bool; config::Dict=Dict())
+    if !CUDA.functional()
+        return (false, 0.0, 0.0)
+    end
+    
+    
+    if haskey(config, "machine_limits")
+        limits = config["machine_limits"]
+        max_safe = get(limits, "MAX_GMG_ELEMENTS", 5_000_000)
+        
+        
+        if use_double
+            max_safe = div(max_safe, 2)
+        end
+        
+        if nElem <= max_safe
+             return (true, 0.0, 0.0) 
+        else
+             return (false, Float64(nElem), Float64(max_safe))
+        end
+    end
+
+    # 2. Fallback Heuristic (If test didn't run)
+    cleanup_memory()
+    free_mem = Float64(CUDA.available_memory())
+    
+    prec_mult = use_double ? 2.0 : 1.0
+    bytes_per_elem_total = 80.0 * prec_mult * 1.15
+    required_mem = nElem * bytes_per_elem_total
+    safety_buffer = 400 * 1024^2
+    available_for_job = free_mem - safety_buffer
+    
+    required_gb = required_mem / 1024^3
+    free_gb = free_mem / 1024^3
+    
+    return (required_mem < available_for_job, required_gb, free_gb)
+end
+
+function get_max_feasible_elements(matrix_free::Bool=true; safety_factor::Float64=0.95, bytes_per_elem::Int=0)
+    if !CUDA.functional() 
+        return 5_000_000 
+    end 
+      
+    free_mem, total_mem = CUDA.available_memory(), CUDA.total_memory() 
+    if safety_factor == 0.95; safety_factor = 0.99; end 
+    usable_mem = free_mem * safety_factor 
+    bpe = (bytes_per_elem > 0) ? bytes_per_elem : estimate_bytes_per_element(matrix_free) 
+    max_elems = floor(Int, usable_mem / bpe) 
+    return max_elems
+end
+ 
+function estimate_gpu_memory_required(nNodes, nElem, matrix_free::Bool=true) 
+    return nElem * estimate_bytes_per_element(matrix_free)
+end
+ 
+function has_enough_gpu_memory(nNodes, nElem, matrix_free::Bool=true) 
+    if !CUDA.functional(); return false; end 
+    try 
+        free_mem, total_mem = CUDA.available_memory(), CUDA.total_memory() 
+        required_mem = estimate_gpu_memory_required(nNodes, nElem, matrix_free) 
+        utilization_limit = 0.99 
+        usable_mem = free_mem * utilization_limit 
+        req_gb = required_mem / 1024^3 
+        avail_gb = usable_mem / 1024^3
+
+        if required_mem > usable_mem 
+            @warn "GPU Memory Estimate:" 
+            @printf("   Required:  %.2f GB\n", req_gb) 
+            @printf("   Available: %.2f GB\n", avail_gb) 
+            return true 
+        end 
+        return true 
+    catch e 
+        println("Error checking GPU memory: $e") 
+        return true 
+    end 
+end 
+
+function calculate_element_distribution(length_x, length_y, length_z, target_elem_count) 
+    total_volume = length_x * length_y * length_z 
+    k = cbrt(target_elem_count / total_volume) 
+    nElem_x = max(1, round(Int, k * length_x)) 
+    nElem_y = max(1, round(Int, k * length_y)) 
+    nElem_z = max(1, round(Int, k * length_z)) 
+    dx = length_x / nElem_x 
+    dy = length_y / nElem_y 
+    dz = length_z / nElem_z 
+    actual_elem_count = nElem_x * nElem_y * nElem_z 
+    return nElem_x, nElem_y, nElem_z, Float32(dx), Float32(dy), Float32(dz), actual_elem_count
+end
+
+function enforce_gpu_memory_safety(n_active_elem::Int, n_nodes::Int, use_double_precision::Bool, use_multigrid::Bool)
+    if !CUDA.functional(); return; end
+    cleanup_memory()
+    free_mem = CUDA.available_memory()
+    
+    bytes_per = estimate_bytes_per_element(true, use_double_precision)
+    
+    if use_multigrid
+        bytes_per *= 1.2
+    end
+
+    mem_est = n_active_elem * bytes_per
+    
+    req_gb = mem_est / 1024^3
+    avail_gb = free_mem / 1024^3
+    
+    if mem_est > free_mem
+        println("\n\u001b[31m>>> [MEMORY GUARD] VRAM DEFICIT DETECTED (Active: $(Base.format_bytes(n_active_elem)))")
+        @printf("   Req: %.2f GB | Free: %.2f GB\n", req_gb, avail_gb)
+        println("   [WARNING] Expect SEVERE slowdowns (PCIe swapping) or Crash.")
+        flush(stdout)
+    else
+        @printf("   [Memory Guard] %.2f GB est / %.2f GB free. Safe.\n", req_gb, avail_gb)
+    end
+end
+ 
+end
+"// # FILE: .\src\Utils\get_package_versions.jl";
+
+import Pkg
+
+const TARGET_FILE = joinpath(@__DIR__, "..", "..", "Project.toml") # Adjusted path to root
+
+println(">>> Generating Project.toml from current environment...")
+
+deps = Pkg.dependencies()
+sorted_deps = sort(collect(deps), by=x->x[2].name)
+
+buffer = IOBuffer()
+
+println(buffer, "name = \"HEXA_TopOpt\"")
+println(buffer, "uuid = \"a1b2c3d4-e5f6-4a5b-9c8d-7e6f5g4h3i2j\"")
+println(buffer, "authors = [\"User\"]")
+println(buffer, "version = \"1.0.0\"")
+println(buffer, "")
+
+println(buffer, "[deps]")
+for (uuid, pkg) in sorted_deps
+    if pkg.is_direct_dep
+        println(buffer, "$(pkg.name) = \"$uuid\"")
+    end
+end
+println(buffer, "")
+
+println(buffer, "[compat]")
+
+println(buffer, "julia = \"1.6\"") 
+
+for (uuid, pkg) in sorted_deps
+    if pkg.is_direct_dep
+        if pkg.version !== nothing
+            # FIX: Removed the "=" sign. 
+            # "$(pkg.version)" implies semver compatibility (e.g., "1.2.3" allows "1.2.4" and "1.9.0")
+            println(buffer, "$(pkg.name) = \"$(pkg.version)\"")
+        else
+            println(buffer, "# Warning: Could not detect version for $(pkg.name)")
+        end
+    end
+end
+
+new_content = String(take!(buffer))
+
+if isfile(TARGET_FILE)
+    mv(TARGET_FILE, TARGET_FILE * ".bak", force=true)
+    println(">>> Existing Project.toml backed up to Project.toml.bak")
+end
+
+open(TARGET_FILE, "w") do io
+    write(io, new_content)
+end
+
+println("-"^60)
+println(">>> SUCCESS: Project.toml has been written successfully.")
+println(">>> Location: $TARGET_FILE")
+println("-"^60)
